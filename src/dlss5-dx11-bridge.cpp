@@ -38,7 +38,7 @@
 #include <cstdint>
 
 // Kept in step with version.rc, which is where ReShade's overlay reads it from.
-#define BRIDGE_VERSION "1.0.12"
+#define BRIDGE_VERSION "1.0.13"
 
 extern "C" __declspec(dllexport) const char *NAME =
     "DLSS 5 DX11 Bridge " BRIDGE_VERSION;
@@ -1566,6 +1566,11 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         // exists even in a game where nothing ever hooks -- and so stage=0 is
         // available as an off switch before launching, without deleting this.
         CfgWriteDefault();
+        // And read it. stage=0 is tested before the first evaluate, and until
+        // now the only load happened inside the session opener it was meant to
+        // prevent -- so the documented off switch still created a D3D12 device
+        // and started an NGX session before anything looked at the file.
+        CfgReload();
         StartWatchingForNgx();
     }
     else if (reason == DLL_PROCESS_DETACH)

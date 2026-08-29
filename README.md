@@ -86,28 +86,51 @@ resource-sharing direction the driver accepted, the result of every NGX call,
 and a timing line every 600 frames:
 
 ```
-[bridge] 600 frames: bridge CPU 7.96 ms/frame | frame interval 10.67 ms (93.7 fps) | bridge is 74% of the frame
+[bridge] 600 frames: bridge CPU 0.84 ms/frame | frame interval 16.00 ms (62.5 fps) | spread 5.74-29.93 ms | bridge is 5% of the frame | d3d12 43200/43202 (2 behind)
 ```
 
-The CPU figure is mostly time spent waiting for the GPU, not work. Read it
-next to the frame interval rather than on its own.
+- **bridge CPU** is time spent inside this add-on, mostly waiting on the GPU
+  rather than working. Read it next to the frame interval, not on its own.
+- **spread** is the widest and narrowest gap between consecutive frames in the
+  window. The average hides it, and it is what a driver-side frame generator
+  responds to.
+- **d3d12 N/M** is how far the D3D12 side is running behind. One to a few is
+  ordinary pipelining. A gap that grows while the log then stops is the
+  transport stalling; a small gap before a log stops dead means it is not.
 
 ## Performance
 
-Measured on one machine, same scene, camera still:
+Baldur's Gate 3, one machine, one scene, camera still, no frame cap. Each row is
+the median of four consecutive 600-frame windows, switched live through `stage`
+so nothing but this add-on changes between them.
 
-| | Frame interval | fps |
-| --- | --- | --- |
-| bridge inert | 8.33 ms | 120.0 (capped) |
-| plumbing only, no evaluate | 8.33 ms | 120.0 (capped) |
-| full bridge, game's DLSS suppressed | 10.66 ms | 93.7 |
-| full bridge, both DLSS passes running | 12.22 ms | 81.9 |
+| `stage` | What runs | Frame interval | fps | Spread |
+| --- | --- | --- | --- | --- |
+| 0 | nothing at all | 9.10 ms | 109.9 | 5.17–15.98 ms |
+| 2 | the D3D12 device exists; no evaluate, no per-frame fence | 9.06 ms | 110.4 | 4.86–19.01 ms |
+| 3 | everything | 15.99 ms | 62.6 | 5.74–30.16 ms |
 
-The copies, the depth conversion and both cross-API fences cost nothing
-measurable — with the evaluate disabled the frame time is unchanged. The whole
-cost is the DLSS and neural-rendering work itself.
+Two things follow.
 
-`skip_game=1` is worth about 1.5 ms per frame.
+**The transport is free.** `stage=0` and `stage=2` are the same measurement. The
+second D3D12 device, its queue and its allocators cost nothing while they sit
+idle, so the whole cost is the neural work itself. CPU time inside this add-on
+is 0.84 ms per frame at `stage=3`, about 5% of the frame; the rest is GPU.
+
+**It is not a small cost.** 110 fps to 62 in this scene. Earlier figures in this
+file reported a smaller loss because they were taken against a 120 fps cap that
+hid the headroom being consumed.
+
+The spread column is the widest and narrowest gap between consecutive frames in
+each window. Relative to its own frame rate the full bridge is the *steadier* of
+the three — max over mean is 1.87–1.90 at `stage=3` against 1.66–2.44 at
+`stage=2` — so the wider absolute spread is the frame rate halving, not pacing
+being disturbed. That matters if a driver-side frame generator is interpolating
+between these frames: it receives a slower but more regular sequence, and what
+becomes visible is its own interpolation rather than any jitter introduced here.
+
+`skip_game=1`, the default, avoids running the game's own DLSS pass as well as
+this one; it was worth about 1.5 ms per frame when measured separately.
 
 ## Related
 

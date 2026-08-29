@@ -39,6 +39,13 @@ struct Bridge
     UINT      slot_w[4];
     UINT      slot_h[4];
 
+    // Frame-to-frame pacing. The average alone hides the spread, and a driver
+    // that interpolates between presented frames -- NVIDIA's Smooth Motion --
+    // cares about the spread rather than the average.
+    LONGLONG  last_entry;
+    LONGLONG  iv_min;
+    LONGLONG  iv_max;
+
     UINT64    last_completed;   // to tell a stalled GPU from a busy one
     UINT64    pending_out;
     ULONGLONG pending_since;

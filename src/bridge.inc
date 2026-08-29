@@ -11,9 +11,10 @@ static NVSDK_NGX_Result SafeEvaluateGuarded(PFN_D3D12EvaluateFeature fn,
 }
 
 // Everything worth trying here is a value, not code, and the add-on binary is
-// locked while the game runs. So the tunables live in ngxprobe.cfg, re-read
-// while playing: edit the file, and within a second the bridge picks it up and
-// rebuilds whatever the change invalidates. One session, many experiments.
+// locked while the game runs. So the tunables live in dlss5-dx11-bridge.cfg,
+// re-read while playing: edit it, and within a second the bridge picks the
+// change up and rebuilds whatever it invalidates. One session, many
+// experiments.
 //
 //   mode=2         0 never writes to the game, 1 transport only, 2 full path
 //   flags=107      DLSS.Feature.Create.Flags. Bit 0 is IsHDR, which is what
@@ -57,6 +58,17 @@ static void TimingTick(LONGLONG entry, LONGLONG exit)
     }
 
     g_bridge.cpu_ticks += (exit - entry);
+
+    // The gap between one frame's arrival and the next. Averaged over 600
+    // frames this says nothing about smoothness; the widest and narrowest do.
+    if (g_bridge.last_entry != 0)
+    {
+        const LONGLONG iv = entry - g_bridge.last_entry;
+        if (g_bridge.iv_min == 0 || iv < g_bridge.iv_min) g_bridge.iv_min = iv;
+        if (iv > g_bridge.iv_max) g_bridge.iv_max = iv;
+    }
+    g_bridge.last_entry = entry;
+
     if (++g_bridge.timed_frames < 600) return;
 
     const double span_ms = 1000.0 * double(exit - g_bridge.span_start) / double(g_bridge.qpf);
@@ -69,13 +81,29 @@ static void TimingTick(LONGLONG entry, LONGLONG exit)
     // then evidence rather than an inference.
     const UINT64 done = g_bridge.fence12 != nullptr
                       ? g_bridge.fence12->GetCompletedValue() : 0;
+    if (done == UINT64_MAX)
+    {
+        Log("[bridge] %.0f frames: bridge CPU %.2f ms/frame | frame interval %.2f ms "
+            "(%.1f fps) | spread %.2f-%.2f ms | d3d12 DEVICE REMOVED",
+            n, cpu_ms / n, span_ms / n, 1000.0 / (span_ms / n),
+            1000.0 * double(g_bridge.iv_min) / double(g_bridge.qpf),
+            1000.0 * double(g_bridge.iv_max) / double(g_bridge.qpf));
+        g_bridge.iv_min = 0; g_bridge.iv_max = 0;
+        g_bridge.cpu_ticks = 0; g_bridge.timed_frames = 0; g_bridge.span_start = exit;
+        return;
+    }
+
+    const double lo = 1000.0 * double(g_bridge.iv_min) / double(g_bridge.qpf);
+    const double hi = 1000.0 * double(g_bridge.iv_max) / double(g_bridge.qpf);
 
     Log("[bridge] %.0f frames: bridge CPU %.2f ms/frame | frame interval %.2f ms (%.1f fps) "
-        "| bridge is %.0f%% of the frame | d3d12 %llu/%llu (%lld behind)",
-        n, cpu_ms / n, span_ms / n, 1000.0 / (span_ms / n), 100.0 * cpu_ms / span_ms,
-        done, g_bridge.fence_value,
+        "| spread %.2f-%.2f ms | bridge is %.0f%% of the frame | d3d12 %llu/%llu (%lld behind)",
+        n, cpu_ms / n, span_ms / n, 1000.0 / (span_ms / n), lo, hi,
+        100.0 * cpu_ms / span_ms, done, g_bridge.fence_value,
         static_cast<long long>(g_bridge.fence_value) - static_cast<long long>(done));
 
+    g_bridge.iv_min       = 0;
+    g_bridge.iv_max       = 0;
     g_bridge.cpu_ticks    = 0;
     g_bridge.timed_frames = 0;
     g_bridge.span_start   = exit;
@@ -511,7 +539,14 @@ static void BridgeDrainGpu()
     if (g_bridge.fence12->GetCompletedValue() < v && g_bridge.fence_event != nullptr)
     {
         g_bridge.fence12->SetEventOnCompletion(v, g_bridge.fence_event);
-        if (WaitForSingleObject(g_bridge.fence_event, 5000) != WAIT_OBJECT_0)
+        // The wake is not the answer; the fence is. SetEventOnCompletion cannot
+        // be cancelled, so a wait that timed out earlier leaves a live
+        // registration, and one auto-reset event serves all three waits here --
+        // a stale signal would otherwise satisfy this one for the wrong value
+        // and let the release below run while command lists still reference the
+        // resources, which is exactly what this drain exists to prevent.
+        if (WaitForSingleObject(g_bridge.fence_event, 5000) != WAIT_OBJECT_0 ||
+            g_bridge.fence12->GetCompletedValue() < v)
             Log("[bridge] timed out draining the queue before teardown");
     }
     // Every allocator is now retired, so none of them needs waiting on again.
@@ -1090,7 +1125,8 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt,
     if (g_bridge.fence12->GetCompletedValue() < v)
     {
         g_bridge.fence12->SetEventOnCompletion(v, g_bridge.fence_event);
-        if (WaitForSingleObject(g_bridge.fence_event, 4000) != WAIT_OBJECT_0)
+        if (WaitForSingleObject(g_bridge.fence_event, 4000) != WAIT_OBJECT_0 ||
+            g_bridge.fence12->GetCompletedValue() < v)
         {
             Log("[bridge] feature creation did not complete within 4 s; giving up.");
             BridgeDisable("creating the DLSS feature crashed");
@@ -1161,7 +1197,8 @@ static bool BeginCommands()
         // This blocks the thread the game renders on, so it has to give up long
         // before a render-thread watchdog would fire. A missed frame is
         // recoverable; a thirty-second stall is the game being killed.
-        if (WaitForSingleObject(g_bridge.fence_event, 2000) != WAIT_OBJECT_0)
+        if (WaitForSingleObject(g_bridge.fence_event, 2000) != WAIT_OBJECT_0 ||
+            g_bridge.fence12->GetCompletedValue() < retire)
         {
             Log("[bridge] the GPU did not retire allocator slot %d within 2 s.", slot);
             Log("  Something downstream is not completing. Stopping rather than");
@@ -1187,9 +1224,41 @@ static bool BeginCommands()
 // pipelining and is what keeps the CPU free; being behind by half a second is
 // not. An ID3D12Fence can be signalled from the CPU, and that releases the
 // game's queue whether or not the work ever arrives.
+// ID3D12Fence::GetCompletedValue returns UINT64_MAX for exactly one reason: the
+// device has been removed. Escape from Tarkov produced it mid-session, and
+// nothing noticed -- the bridge went on copying its last good Output over the
+// game's every frame, so the world froze while the interface, drawn after that
+// copy, kept updating. Opening the inventory appeared to fix it.
+static bool BridgeDeviceLost()
+{
+    if (g_bridge.fence12 == nullptr) return false;
+    if (g_bridge.fence12->GetCompletedValue() != UINT64_MAX) return false;
+
+    const HRESULT why = g_bridge.dev12 != nullptr
+                      ? g_bridge.dev12->GetDeviceRemovedReason() : 0;
+    Log("[bridge] the D3D12 device has been removed (reason 0x%08X).", why);
+    switch (why)
+    {
+    case DXGI_ERROR_DEVICE_HUNG:
+        Log("  The GPU stopped responding to work submitted on it -- a TDR."); break;
+    case DXGI_ERROR_DEVICE_REMOVED:
+        Log("  The adapter was removed or reset underneath the process."); break;
+    case DXGI_ERROR_DEVICE_RESET:
+        Log("  The device was reset after an invalid command."); break;
+    case DXGI_ERROR_DRIVER_INTERNAL_ERROR:
+        Log("  The driver reported an internal error."); break;
+    default: break;
+    }
+    Log("  Nothing can be recovered from here, and continuing would copy a frozen");
+    Log("  image over the game's own every frame. Stopping.");
+    BridgeDisable("the D3D12 device was removed");
+    return true;
+}
+
 static void BridgeRescueStalledQueue()
 {
     if (g_bridge.fence12 == nullptr) return;
+    if (BridgeDeviceLost()) return;
 
     const UINT64 done = g_bridge.fence12->GetCompletedValue();
     const ULONGLONG now = GetTickCount64();
@@ -1447,6 +1516,17 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
     //    conversion pass when the driver would not share the game's format.
     ctx->CopyResource(g_bridge.tex11[SLOT_COLOR], g[SLOT_COLOR]);
     if (g_bridge.mv_converted) BridgeBlitMV(ctx, dev11, g[SLOT_MV]);
+
+    // BridgeDisable is the one shutdown routine and releases every mirror, so
+    // anything that can reach it from inside this frame leaves the rest of the
+    // frame with null textures to barrier and copy. Checking the flag once at
+    // the top is no longer enough now that it can be set from here.
+    if (g_bridge.disabled)
+    {
+        for (int i = 0; i < SLOT_COUNT; ++i) g[i]->Release();
+        dev11->Release();
+        return;
+    }
     else                       ctx->CopyResource(g_bridge.tex11[SLOT_MV], g[SLOT_MV]);
     if (g_cfg.stage >= 2 && g_bridge.depth_converted)
         BridgeBlitDepth(ctx, dev11, g[SLOT_DEPTH]);
