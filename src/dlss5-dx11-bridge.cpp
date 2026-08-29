@@ -38,7 +38,7 @@
 #include <cstdint>
 
 // Kept in step with version.rc, which is where ReShade's overlay reads it from.
-#define BRIDGE_VERSION "1.0.3"
+#define BRIDGE_VERSION "1.0.4"
 
 extern "C" __declspec(dllexport) const char *NAME =
     "DLSS 5 DX11 Bridge " BRIDGE_VERSION;
@@ -113,13 +113,28 @@ static void Log(const char *fmt, ...)
     SYSTEMTIME st;
     GetLocalTime(&st);
 
+    // A per-frame message that nobody stopped can fill a disk on someone else's
+    // machine. Bound the file so the worst case is a truncated log, not that.
+    static long   written = 0;
+    static bool   capped  = false;
+    const  long   kCap    = 8 * 1024 * 1024;
+
     EnterCriticalSection(&g_log_cs);
-    FILE *f = nullptr;
-    if (fopen_s(&f, g_log_path, "a") == 0 && f != nullptr)
+    if (!capped)
     {
-        fprintf(f, "%02u:%02u:%02u.%03u  %s\n", st.wHour, st.wMinute, st.wSecond,
-                st.wMilliseconds, line);
-        fclose(f);
+        FILE *f = nullptr;
+        if (fopen_s(&f, g_log_path, "a") == 0 && f != nullptr)
+        {
+            written += fprintf(f, "%02u:%02u:%02u.%03u  %s\n", st.wHour, st.wMinute,
+                               st.wSecond, st.wMilliseconds, line);
+            if (written > kCap)
+            {
+                fprintf(f, "\n--- log capped at 8 MB. Something is repeating every "
+                           "frame; the lines above still say what. ---\n");
+                capped = true;
+            }
+            fclose(f);
+        }
     }
     LeaveCriticalSection(&g_log_cs);
 }

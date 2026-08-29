@@ -251,12 +251,43 @@ static bool BridgeBlitDepth(ID3D11DeviceContext *ctx, ID3D11Device *dev11, ID3D1
         if (g_bridge.depth_srv != nullptr) { g_bridge.depth_srv->Release(); g_bridge.depth_srv = nullptr; }
         if (g_bridge.depth_src != nullptr) { g_bridge.depth_src->Release(); g_bridge.depth_src = nullptr; }
 
+        // A depth buffer is typeless, and which view format is legal depends on
+        // which typeless family it belongs to. Hardcoding one only ever works
+        // for the game it was written against.
+        D3D11_TEXTURE2D_DESC sdesc = {};
+        src->GetDesc(&sdesc);
+
+        DXGI_FORMAT view = DXGI_FORMAT_UNKNOWN;
+        switch (sdesc.Format)
+        {
+        case DXGI_FORMAT_R24G8_TYPELESS:
+        case DXGI_FORMAT_D24_UNORM_S8_UINT:      view = DXGI_FORMAT_R24_UNORM_X8_TYPELESS; break;
+        case DXGI_FORMAT_R32_TYPELESS:
+        case DXGI_FORMAT_D32_FLOAT:              view = DXGI_FORMAT_R32_FLOAT; break;
+        case DXGI_FORMAT_R32G8X24_TYPELESS:
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:   view = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS; break;
+        case DXGI_FORMAT_R16_TYPELESS:
+        case DXGI_FORMAT_D16_UNORM:              view = DXGI_FORMAT_R16_UNORM; break;
+        default:                                 view = sdesc.Format; break;  // already typed
+        }
+
         D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
-        sd.Format                    = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
-        sd.ViewDimension             = D3D11_SRV_DIMENSION_TEXTURE2D;
-        sd.Texture2D.MipLevels       = 1;
+        sd.Format              = view;
+        sd.ViewDimension       = D3D11_SRV_DIMENSION_TEXTURE2D;
+        sd.Texture2D.MipLevels = 1;
         HRESULT hr = dev11->CreateShaderResourceView(src, &sd, &g_bridge.depth_srv);
-        if (FAILED(hr)) { Log("[bridge] depth SRV failed 0x%08X", hr); return false; }
+        if (FAILED(hr))
+        {
+            // Repeating this every frame produces hundreds of megabytes of log
+            // and hides everything else, so say it once and stop trying.
+            Log("[bridge] cannot read the game's depth: format %u has no usable view "
+                "(tried %u, got 0x%08X).", sdesc.Format, view, hr);
+            Log("  Depth will not reach DLSS. Image quality will suffer, especially");
+            Log("  around moving objects. Please report this format.");
+            g_bridge.depth_converted = false;
+            return false;
+        }
+        Log("[bridge] depth view: resource format %u read as %u", sdesc.Format, view);
 
         g_bridge.depth_src = src;
         src->AddRef();  // keep the pointer from being recycled under the cache
