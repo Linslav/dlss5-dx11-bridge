@@ -36,9 +36,10 @@
 #include <cstdio>
 #include <cstdarg>
 #include <cstdint>
+#pragma comment(lib, "version.lib")
 
 // Kept in step with version.rc, which is where ReShade's overlay reads it from.
-#define BRIDGE_VERSION "1.0.14"
+#define BRIDGE_VERSION "1.0.15"
 
 extern "C" __declspec(dllexport) const char *NAME =
     "DLSS 5 DX11 Bridge " BRIDGE_VERSION;
@@ -731,6 +732,111 @@ static void DumpCapability(NVSDK_NGX_Parameter *caps)
 static void RetractIdleNote();
 static void TryInstallHooks();
 
+// Reads a file's VERSIONINFO. Every component in this stack is versioned and
+// distributed separately -- the driver's NGX loader, the feature snippets, the
+// DLSS 5 add-on -- and a report that names them without their versions cannot
+// be compared against a working machine.
+static bool FileVersionString(const wchar_t *path, char *out, size_t n)
+{
+    out[0] = '\0';
+    DWORD ignored = 0;
+    const DWORD size = GetFileVersionInfoSizeW(path, &ignored);
+    if (size == 0) return false;
+
+    void *buf = malloc(size);
+    if (buf == nullptr) return false;
+
+    bool ok = false;
+    if (GetFileVersionInfoW(path, 0, size, buf))
+    {
+        VS_FIXEDFILEINFO *fi = nullptr;
+        UINT len = 0;
+        if (VerQueryValueW(buf, L"\\", reinterpret_cast<void **>(&fi), &len) &&
+            fi != nullptr && len >= sizeof(VS_FIXEDFILEINFO))
+        {
+            sprintf_s(out, n, "%u.%u.%u.%u",
+                      HIWORD(fi->dwFileVersionMS), LOWORD(fi->dwFileVersionMS),
+                      HIWORD(fi->dwFileVersionLS), LOWORD(fi->dwFileVersionLS));
+            ok = true;
+        }
+    }
+    free(buf);
+    return ok;
+}
+
+// Logs a file's version next to its name, or says the file carries none.
+static void LogFileVersion(const wchar_t *dir, const wchar_t *leaf, const char *label)
+{
+    wchar_t path[MAX_PATH];
+    wcscpy_s(path, dir);
+    wcscat_s(path, leaf);
+
+    char ver[64];
+    if (FileVersionString(path, ver, sizeof(ver)))
+        Log("    %-26ls %s  version %s", leaf, label, ver);
+    else
+        Log("    %-26ls %s  (no version resource)", leaf, label);
+}
+
+// The DLSS 5 add-on keeps its own settings in ReShade.ini, and those settings
+// decide whether it does anything at all. Reading them here answers from the
+// log what previously needed a screenshot of its overlay: whether neural
+// rendering was even enabled, whether upscaling was requested, which depth
+// convention was chosen. Only keys this add-on's neighbour is known to write
+// are reported; nothing else in the file is touched or logged.
+static void LogReShadeConfig(const wchar_t *dir)
+{
+    wchar_t path[MAX_PATH];
+    wcscpy_s(path, dir);
+    wcscat_s(path, L"ReShade.ini");
+
+    FILE *f = nullptr;
+    if (_wfopen_s(&f, path, L"rb") != 0 || f == nullptr)
+    {
+        Log("  ReShade.ini: not next to this add-on, so the DLSS 5 add-on's own "
+            "settings could not be read.");
+        return;
+    }
+
+    char section[128] = "";
+    char line[512];
+    bool header = false;
+    while (fgets(line, sizeof(line), f) != nullptr)
+    {
+        char *b = line;
+        while (*b == ' ' || *b == '\t') ++b;
+        size_t l = strlen(b);
+        while (l > 0 && (b[l - 1] == '\n' || b[l - 1] == '\r' || b[l - 1] == ' ')) b[--l] = '\0';
+        if (l == 0) continue;
+
+        if (b[0] == '[')
+        {
+            strcpy_s(section, b);
+            continue;
+        }
+
+        // Every setting the DLSS 5 add-on writes begins with NR. Matching on the
+        // prefix rather than a fixed list keeps this working when it gains a
+        // setting, and the section name is logged so a coincidence is readable
+        // as one rather than mistaken for the add-on.
+        if (b[0] != 'N' || b[1] != 'R') continue;
+        if (strchr(b, '=') == nullptr) continue;
+
+        if (!header)
+        {
+            Log("  DLSS 5 add-on settings, read from ReShade.ini %s:", section);
+            header = true;
+        }
+        Log("    %s", b);
+    }
+    fclose(f);
+
+    if (!header)
+        Log("  ReShade.ini holds no DLSS 5 add-on settings. Its overlay has "
+            "probably never been opened, so it is running on its defaults.");
+}
+
+
 // Handles created for a feature that is not DLSS super resolution. Their
 // parameter blocks are not an upscaling contract -- The Elder Scrolls Online
 // runs frame generation through the same D3D11 entry points -- so an evaluate
@@ -1098,6 +1204,11 @@ static int HookNewNgxModules()
         L.mod = mods[i];
 
         Log("NGX layer %ld: %ls (base=%p)", slot, path, static_cast<void *>(mods[i]));
+        {
+            char ver[64];
+            if (FileVersionString(path, ver, sizeof(ver)))
+                Log("  version %s", ver);
+        }
         Log("  NVSDK_NGX_D3D11_CreateFeature     = %p", create);
         Log("  NVSDK_NGX_D3D11_EvaluateFeature   = %p", eval);
         Log("  NVSDK_NGX_D3D11_EvaluateFeature_C = %p", eval_c);
@@ -1200,7 +1311,8 @@ static void LogNeighbours()
         wcscpy_s(p, dir);
         wcscat_s(p, n);
         const bool here = GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES;
-        Log("    %-26ls %s", n, here ? "present" : "MISSING");
+        if (here) LogFileVersion(dir, n, "present");
+        else      Log("    %-26ls MISSING", n);
 
         // The model file is NVIDIA's, and its name is fixed by NVIDIA rather than
         // by anyone's add-on, so its absence can be raised where it is seen.
@@ -1218,9 +1330,11 @@ static void LogNeighbours()
     if (h != INVALID_HANDLE_VALUE)
     {
         Log("  add-ons present:");
-        do { Log("    %ls", fd.cFileName); } while (FindNextFileW(h, &fd));
+        do { LogFileVersion(dir, fd.cFileName, ""); } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
+
+    LogReShadeConfig(dir);
 }
 
 // When the D3D11 entry points are not found, the useful question is what IS
@@ -1288,7 +1402,6 @@ static PFN_LdrUnregisterDllNotification g_ldr_unregister;
 static volatile LONG g_hooks_installed;
 static ULONGLONG     g_hook_time;
 static volatile LONG g_idle_reported;
-
 // Safe to call repeatedly and from the loader callback: it does nothing once
 // the hooks are in, and everything it does before that is a name lookup.
 static void TryInstallHooks()

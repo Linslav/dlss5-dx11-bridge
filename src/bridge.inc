@@ -17,8 +17,14 @@ static NVSDK_NGX_Result SafeEvaluateGuarded(PFN_D3D12EvaluateFeature fn,
 // experiments.
 //
 //   mode=2         0 never writes to the game, 1 transport only, 2 full path
-//   flags=107      DLSS.Feature.Create.Flags. Bit 0 is IsHDR, which is what
-//                  makes RenoDX apply its HDR codec; 106 clears it
+//   dred=1         ask D3D12 to record what the GPU was executing, so a reset
+//                  can be explained. Read once, when the session opens, so a
+//                  change takes effect on the next launch
+//   flags=-1       DLSS.Feature.Create.Flags. -1 copies whatever the game
+//                  asked for, which is the only value guaranteed to describe
+//                  the game's own buffers. Any other value forces that value:
+//                  bit 0 is IsHDR, which is what makes RenoDX apply its HDR
+//                  codec, and 107 is what Baldur's Gate 3 asks for
 //   subrects=0     value for DLSS.Enable.Output.Subrects
 //   reset_every=0  1 forces Reset on every frame, killing temporal history
 //   pixels=0       1 enables the centre-pixel readback (stalls the GPU hard)
@@ -32,6 +38,45 @@ static NVSDK_NGX_Result SafeEvaluateGuarded(PFN_D3D12EvaluateFeature fn,
 //                  overwritten by this bridge anyway, so running it is wasted
 //                  work -- this is where most of the frame cost comes back.
 //                  Only takes effect while the bridge is actually delivering.
+// The create flags are the only place the game states what its own buffers
+// mean: whether the colour carries values above 1.0, whether the depth is
+// reversed, whether the motion vectors are at render resolution. Spelling them
+// out costs one line and removes the arithmetic from every report.
+static void LogCreateFlags(const char *what, unsigned int f)
+{
+    char b[192];
+    b[0] = 0;
+    if (f & 0x01) strcat_s(b, " IsHDR");
+    if (f & 0x02) strcat_s(b, " MVLowRes");
+    if (f & 0x04) strcat_s(b, " MVJittered");
+    if (f & 0x08) strcat_s(b, " DepthInverted");
+    if (f & 0x20) strcat_s(b, " DoSharpening");
+    if (f & 0x40) strcat_s(b, " AutoExposure");
+    if (b[0] == 0) strcat_s(b, " none");
+    Log("[bridge] %s flags %u:%s", what, f, b);
+}
+
+// An 8-bit normalised format cannot hold a value above 1.0, so a buffer in one
+// is not HDR whatever the flags say. The DLSS 5 add-on picks its codec from
+// that flag, and picking the HDR codec for an SDR buffer is a silent wrong
+// answer rather than an error, so it is worth stating outright.
+static bool FormatIsLowPrecisionUnorm(DXGI_FORMAT f)
+{
+    switch (f)
+    {
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8X8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+        return true;
+    default:
+        return false;
+    }
+}
+
 struct BridgeCfg
 {
     int mode;
@@ -41,9 +86,10 @@ struct BridgeCfg
     int pixels;
     int stage;
     int skip_game;
+    int dred;
 };
 
-static BridgeCfg g_cfg = { 2, 107, 1, 0, 0, 3, 1 };
+static BridgeCfg g_cfg = { 2, -1, 1, 0, 0, 3, 1, 1 };
 
 // Accumulates the two figures and reports them together, because either one
 // alone is misleading.
@@ -102,6 +148,20 @@ static void TimingTick(LONGLONG entry, LONGLONG exit)
         100.0 * cpu_ms / span_ms, done, g_bridge.fence_value,
         static_cast<long long>(g_bridge.fence_value) - static_cast<long long>(done));
 
+    // This measures the gap between the game's own DLSS calls, so a loading
+    // screen, an alt-tab or a paused game all land here as one enormous frame --
+    // Baldur's Gate 3 produced 13370 ms and carried on for thousands of frames
+    // afterwards. It is reported because Windows resets a GPU that stops
+    // answering for about two seconds, and Escape from Tarkov recorded 2534 ms
+    // eight seconds before losing its device. The figure alone does not say
+    // which of the two happened.
+    if (hi >= 1500.0)
+        Log("[bridge]   one frame took %.0f ms. Usually that is a loading screen, "
+            "an alt-tab or a pause, since this measures the gap between the game's "
+            "own DLSS calls. It is noted because Windows resets a GPU that stops "
+            "answering for about two seconds, so the same figure appears before a "
+            "device removal.", hi);
+
     g_bridge.iv_min       = 0;
     g_bridge.iv_max       = 0;
     g_bridge.cpu_ticks    = 0;
@@ -142,6 +202,7 @@ static void CfgReload()
         if (sscanf_s(line, "%63[^=]=%d", key, static_cast<unsigned>(sizeof(key)), &val) != 2) continue;
         if      (_stricmp(key, "mode")        == 0) next.mode        = val;
         else if (_stricmp(key, "flags")       == 0) next.flags       = val;
+        else if (_stricmp(key, "dred")        == 0) next.dred        = val;
         else if (_stricmp(key, "subrects")    == 0) next.subrects    = val;
         else if (_stricmp(key, "reset_every") == 0) next.reset_every = val;
         else if (_stricmp(key, "pixels")      == 0) next.pixels      = val;
@@ -160,9 +221,10 @@ static void CfgReload()
     if (!changed) return;
 
     g_cfg = next;
-    Log("[bridge] config: stage=%d mode=%d flags=%d subrects=%d reset_every=%d pixels=%d skip_game=%d",
+    Log("[bridge] config: stage=%d mode=%d flags=%d subrects=%d reset_every=%d pixels=%d "
+        "skip_game=%d dred=%d",
         g_cfg.stage, g_cfg.mode, g_cfg.flags, g_cfg.subrects, g_cfg.reset_every, g_cfg.pixels,
-        g_cfg.skip_game);
+        g_cfg.skip_game, g_cfg.dred);
 
     // Creation-time values only take effect on a new feature, so invalidate the
     // current one and let the next frame build it again.
@@ -177,9 +239,9 @@ static void CfgWriteDefault()
 
     FILE *f = nullptr;
     if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
-    fprintf(f, "stage=%d\nmode=%d\nskip_game=%d\nflags=%d\nsubrects=%d\nreset_every=%d\npixels=%d\n",
+    fprintf(f, "stage=%d\nmode=%d\nskip_game=%d\nflags=%d\nsubrects=%d\nreset_every=%d\npixels=%d\ndred=%d\n",
             g_cfg.stage, g_cfg.mode, g_cfg.skip_game, g_cfg.flags, g_cfg.subrects,
-            g_cfg.reset_every, g_cfg.pixels);
+            g_cfg.reset_every, g_cfg.pixels, g_cfg.dred);
     fclose(f);
     Log("[bridge] wrote default config to %s", path);
 }
@@ -228,6 +290,33 @@ static void BridgeReleaseTextures();
 // nothing else, which left the DLSS feature, four shared textures and their NT
 // handles resident for the rest of the session -- while telling the user the
 // game was rendering normally.
+// Device Removed Extended Data. When Windows resets a hung GPU, the only
+// account of what it was doing lives in the driver, and DRED is how it is asked
+// for: a per-command-list record of how many operations completed, and the
+// allocation behind a bad address. Escape from Tarkov reports
+// DXGI_ERROR_DEVICE_HUNG about twenty seconds in, and nothing else about it is
+// known. This must be switched on before the device exists, so it is done here
+// rather than where the removal is noticed.
+static void EnableDred(HMODULE d3d12)
+{
+    auto get_debug = reinterpret_cast<HRESULT (WINAPI *)(REFIID, void **)>(
+        GetProcAddress(d3d12, "D3D12GetDebugInterface"));
+    if (get_debug == nullptr)
+    { Log("[bridge] DRED is unavailable: d3d12.dll exports no debug interface."); return; }
+
+    ID3D12DeviceRemovedExtendedDataSettings *set = nullptr;
+    if (FAILED(get_debug(__uuidof(ID3D12DeviceRemovedExtendedDataSettings),
+                         reinterpret_cast<void **>(&set))) || set == nullptr)
+    { Log("[bridge] DRED is unavailable on this Windows build."); return; }
+
+    set->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+    set->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+    set->Release();
+    Log("[bridge] DRED is on: if the GPU is reset, what it was executing will be "
+        "recorded here.");
+}
+
+// Reads back what DRED collected. Only meaningful after the device is gone.
 static void BridgeDisable(const char *why)
 {
     if (g_bridge.disabled) return;
@@ -633,6 +722,8 @@ static bool BridgeInitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
         ? reinterpret_cast<PFN_D3D12CreateDevice_>(GetProcAddress(d3d12, "D3D12CreateDevice"))
         : nullptr;
     if (create_device == nullptr) { Log("[bridge] no D3D12CreateDevice"); goto fail; }
+    if (g_cfg.dred != 0) EnableDred(d3d12);
+    else Log("[bridge] DRED is off by config; a GPU reset will not be explained.");
 
     {
         HRESULT hr = create_device(adapter, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
@@ -797,6 +888,12 @@ static bool BridgeInitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
         NVSDK_NGX_Result rp = SafeAllocParams(g_bridge.alloc_params, &g_bridge.params, &code);
         if (code != 0 || rp != NGX_SUCCESS || g_bridge.params == nullptr)
         { Log("[bridge] AllocateParameters failed 0x%08X", rp); goto fail; }
+
+        // DRED reports a hung GPU by naming the command list and queue that
+        // stopped. Unnamed objects come back as blanks, which is useless in a
+        // process holding several of each.
+        if (g_bridge.queue != nullptr) g_bridge.queue->SetName(L"dlss5-dx11-bridge queue");
+        if (g_bridge.list  != nullptr) g_bridge.list->SetName(L"dlss5-dx11-bridge list");
 
         Log("[bridge] session ready: queue=%p list=%p fence12=%p fence11=%p (%d frames in flight)",
             static_cast<void *>(g_bridge.queue), static_cast<void *>(g_bridge.list),
@@ -1090,7 +1187,6 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt,
     }
     dev1->Release();
     if (!ok) { BridgeReleaseTextures(); return false; }
-
     // The feature is created with the game's own render and output sizes, not
     // with the texture sizes: in an upscaling mode those are not the same thing.
     g_bridge.params->Set("Width", g_bridge.render_w);
@@ -1098,7 +1194,47 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt,
     g_bridge.params->Set("OutWidth", g_bridge.ngx_out_w);
     g_bridge.params->Set("OutHeight", g_bridge.ngx_out_h);
     g_bridge.params->Set("PerfQualityValue", 2);
-    g_bridge.params->Set("DLSS.Feature.Create.Flags", g_cfg.flags);
+
+    // The create flags describe the game's own buffers: whether the colour is
+    // HDR, whether the depth is reversed, whether the motion vectors are at
+    // render resolution. Forcing a value here invents that description. The
+    // default 107 was Baldur's Gate 3's own answer, so it was right there and
+    // nowhere else: Assetto Corsa asks for 2, and was being told its SDR colour
+    // is HDR and its normal depth is inverted. Copy it, and let the config
+    // force a value only when it is set to something other than -1.
+    if (g_cfg.flags < 0 && gp != nullptr)
+        CopyUIntParam(gp, "DLSS.Feature.Create.Flags", 107u);
+    else
+        g_bridge.params->Set("DLSS.Feature.Create.Flags",
+                             g_cfg.flags < 0 ? 107 : g_cfg.flags);
+    {
+        unsigned int used = 0;
+        g_bridge.params->Get("DLSS.Feature.Create.Flags", &used);
+        unsigned int asked = 0;
+        const bool have_asked =
+            gp != nullptr && gp->Get("DLSS.Feature.Create.Flags", &asked) == NGX_SUCCESS;
+
+        if (have_asked) LogCreateFlags("the game's create", asked);
+        LogCreateFlags(g_cfg.flags < 0 ? "sent to D3D12, copied from the game"
+                                       : "sent to D3D12, forced by config", used);
+
+        // A config written by an older version carries flags=107, which was the
+        // default before it was understood to be Baldur's Gate 3's own answer
+        // rather than a universal one. Such a file keeps forcing it, so say what
+        // the game actually asked for and how to stop overriding it.
+        if (g_cfg.flags >= 0 && have_asked && asked != used)
+            Log("[bridge]   these differ. Set flags=-1 in dlss5-dx11-bridge.cfg to "
+                "copy the game's own value; the file is re-read while playing.");
+
+        // IsHDR is the flag the DLSS 5 add-on reads to choose between its HDR and
+        // its SDR codec, so asserting it over an 8-bit buffer sends it down the
+        // wrong path without any call failing.
+        if ((used & 0x01) != 0 && FormatIsLowPrecisionUnorm(g_bridge.fmt[SLOT_COLOR]))
+            Log("[bridge]   IsHDR is set, but the game's colour buffer is 8-bit "
+                "normalised (fmt=%u) and cannot hold a value above 1.0. The DLSS 5 "
+                "add-on selects its codec from this flag.",
+                static_cast<unsigned>(g_bridge.fmt[SLOT_COLOR]));
+    }
     // Mirror the game's own answer where it gave one. Deus Ex: Mankind Divided
     // asks for 0 here while BG3 asks for 1, and forcing either on the other is
     // inventing part of a contract that is meant to be copied.
@@ -1229,6 +1365,65 @@ static bool BeginCommands()
 // nothing noticed -- the bridge went on copying its last good Output over the
 // game's every frame, so the world froze while the interface, drawn after that
 // copy, kept updating. Opening the inventory appeared to fix it.
+static void LogDred()
+{
+    if (g_bridge.dev12 == nullptr) return;
+
+    ID3D12DeviceRemovedExtendedData *dred = nullptr;
+    if (FAILED(g_bridge.dev12->QueryInterface(__uuidof(ID3D12DeviceRemovedExtendedData),
+                                              reinterpret_cast<void **>(&dred))) ||
+        dred == nullptr)
+    {
+        Log("  DRED did not attach, so what the GPU was executing cannot be recovered.");
+        return;
+    }
+
+    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT bc = {};
+    if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&bc)))
+    {
+        int shown = 0;
+        for (const D3D12_AUTO_BREADCRUMB_NODE *node = bc.pHeadAutoBreadcrumbNode;
+             node != nullptr && shown < 8; node = node->pNext, ++shown)
+        {
+            const UINT done = node->pLastBreadcrumbValue != nullptr
+                            ? *node->pLastBreadcrumbValue : 0;
+            Log("  breadcrumb: list %ls on queue %ls finished %u of %u operations",
+                node->pCommandListDebugNameW != nullptr
+                    ? node->pCommandListDebugNameW : L"(unnamed)",
+                node->pCommandQueueDebugNameW != nullptr
+                    ? node->pCommandQueueDebugNameW : L"(unnamed)",
+                done, node->BreadcrumbCount);
+
+            // The operation at the completed count is the one still running when
+            // the GPU stopped, which is the whole point of asking.
+            if (node->pCommandHistory != nullptr && done < node->BreadcrumbCount)
+                Log("    stopped inside operation %u, D3D12_AUTO_BREADCRUMB_OP %u.",
+                    done, static_cast<unsigned>(node->pCommandHistory[done]));
+        }
+        if (bc.pHeadAutoBreadcrumbNode == nullptr)
+            Log("  no breadcrumbs were recorded, so the reset did not happen inside "
+                "a command list this add-on submitted.");
+    }
+
+    D3D12_DRED_PAGE_FAULT_OUTPUT pf = {};
+    if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&pf)) && pf.PageFaultVA != 0)
+    {
+        Log("  a page fault at GPU virtual address 0x%llX caused the reset.",
+            static_cast<unsigned long long>(pf.PageFaultVA));
+        int shown = 0;
+        for (const D3D12_DRED_ALLOCATION_NODE *a = pf.pHeadExistingAllocationNode;
+             a != nullptr && shown < 6; a = a->pNext, ++shown)
+            Log("    inside live allocation %ls",
+                a->ObjectNameW != nullptr ? a->ObjectNameW : L"(unnamed)");
+        shown = 0;
+        for (const D3D12_DRED_ALLOCATION_NODE *a = pf.pHeadRecentFreedAllocationNode;
+             a != nullptr && shown < 6; a = a->pNext, ++shown)
+            Log("    inside recently freed allocation %ls -- freed while the GPU "
+                "was still reading it", a->ObjectNameW != nullptr ? a->ObjectNameW : L"(unnamed)");
+    }
+    dred->Release();
+}
+
 static bool BridgeDeviceLost()
 {
     if (g_bridge.fence12 == nullptr) return false;
@@ -1249,6 +1444,7 @@ static bool BridgeDeviceLost()
         Log("  The driver reported an internal error."); break;
     default: break;
     }
+    LogDred();
     Log("  Nothing can be recovered from here, and continuing would copy a frozen");
     Log("  image over the game's own every frame. Stopping.");
     BridgeDisable("the D3D12 device was removed");
@@ -1257,6 +1453,9 @@ static bool BridgeDeviceLost()
 
 static void BridgeRescueStalledQueue()
 {
+    // Once the bridge has stopped there is nothing left to rescue, and without
+    // this the device-removed diagnosis below repeats on every later frame.
+    if (g_bridge.disabled) return;
     if (g_bridge.fence12 == nullptr) return;
     if (BridgeDeviceLost()) return;
 
