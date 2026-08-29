@@ -38,7 +38,7 @@
 #include <cstdint>
 
 // Kept in step with version.rc, which is where ReShade's overlay reads it from.
-#define BRIDGE_VERSION "1.0.4"
+#define BRIDGE_VERSION "1.0.5"
 
 extern "C" __declspec(dllexport) const char *NAME =
     "DLSS 5 DX11 Bridge " BRIDGE_VERSION;
@@ -102,6 +102,13 @@ static CRITICAL_SECTION g_log_cs;
 static char             g_log_path[MAX_PATH];
 static HMODULE          g_self;
 
+// Anything that means "your setup is wrong" also goes into ReShade's own log,
+// where its overlay shows it. People reliably post ReShade.log instead of this
+// add-on's, so the messages that matter should be in both.
+typedef void (*PFN_ReShadeLogMessage)(HMODULE, int, const char *);
+static PFN_ReShadeLogMessage g_reshade_log;
+static HMODULE               g_reshade_module;
+
 static void Log(const char *fmt, ...)
 {
     char line[2048];
@@ -137,6 +144,27 @@ static void Log(const char *fmt, ...)
         }
     }
     LeaveCriticalSection(&g_log_cs);
+}
+
+// Same as Log, but the message is also raised in ReShade so the user sees it in
+// the overlay without having to find a file. Reserved for conditions that stop
+// the bridge working -- routine progress stays in this add-on's own log.
+static void Warn(const char *fmt, ...)
+{
+    char line[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    _vsnprintf_s(line, sizeof(line), _TRUNCATE, fmt, ap);
+    va_end(ap);
+
+    Log("%s", line);
+
+    if (g_reshade_log != nullptr)
+    {
+        char tagged[1100];
+        _snprintf_s(tagged, sizeof(tagged), _TRUNCATE, "[DLSS 5 DX11 Bridge] %s", line);
+        g_reshade_log(g_reshade_module, 1 /* error */, tagged);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -633,13 +661,29 @@ static HMODULE FindNgxModule(void **out_eval, void **out_eval_c, void **out_crea
         void *eval   = reinterpret_cast<void *>(GetProcAddress(mods[i], "NVSDK_NGX_D3D11_EvaluateFeature"));
         void *eval_c = reinterpret_cast<void *>(GetProcAddress(mods[i], "NVSDK_NGX_D3D11_EvaluateFeature_C"));
         void *create = reinterpret_cast<void *>(GetProcAddress(mods[i], "NVSDK_NGX_D3D11_CreateFeature"));
-        if (create != nullptr && (eval != nullptr || eval_c != nullptr))
+        if (create == nullptr || (eval == nullptr && eval_c == nullptr)) continue;
+
+        // The feature snippets -- nvngx_dlss.dll and friends -- export the same
+        // symbols as the loader that calls them, so matching on exports alone
+        // can pick the layer underneath the one the game actually calls. Hooking
+        // there intercepts NGX's own internal calls instead, and a snippet
+        // shipped alongside a game can be a different build from the driver's.
+        // Skip them: the right target is the caller's side, not the callee's.
+        wchar_t path[MAX_PATH] = {};
+        GetModuleFileNameW(mods[i], path, MAX_PATH);
+        const wchar_t *leaf = wcsrchr(path, L'\\');
+        leaf = leaf ? leaf + 1 : path;
+        if (_wcsnicmp(leaf, L"nvngx_", 6) == 0)
         {
-            *out_eval   = eval;
-            *out_eval_c = eval_c;
-            *out_create = create;
-            return mods[i];
+            Log("  skipping %ls: that is an NGX feature snippet, not the entry point "
+                "the game calls.", leaf);
+            continue;
         }
+
+        *out_eval   = eval;
+        *out_eval_c = eval_c;
+        *out_create = create;
+        return mods[i];
     }
     return nullptr;
 }
@@ -650,7 +694,14 @@ static void LogPrologue(const char *label, const BYTE *p)
     int  n = 0;
     for (int i = 0; i < 14; ++i)
         n += _snprintf_s(hex + n, sizeof(hex) - n, _TRUNCATE, "%02X ", p[i]);
-    Log("  %-16s prologue: %s", label, hex);
+
+    // A jump where the prologue should be means something else hooked this
+    // first. Chaining onto it can work, but when it does not this is the line
+    // that explains why, so it is worth saying out loud.
+    const bool detoured = (p[0] == 0xE9) || (p[0] == 0xFF && p[1] == 0x25) ||
+                          (p[0] == 0x48 && p[1] == 0xB8) || (p[0] == 0xEB);
+    Log("  %-16s prologue: %s%s", label, hex,
+        detoured ? " <== already hooked by something else" : "");
 }
 
 // A log that only describes this add-on cannot diagnose a setup problem. These
@@ -693,13 +744,21 @@ static void LogNeighbours()
     };
 
     Log("  files next to this add-on:");
-    for (const wchar_t *n : needed)
+    for (int i = 0; i < 3; ++i)
     {
+        const wchar_t *n = needed[i];
         wchar_t p[MAX_PATH];
         wcscpy_s(p, dir);
         wcscat_s(p, n);
         const bool here = GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES;
         Log("    %-26ls %s", n, here ? "present" : "MISSING");
+
+        // The first two are required. Missing either means nothing will happen
+        // and no amount of staring at this add-on will explain why, so it is
+        // raised where the user will actually see it.
+        if (!here && i < 2)
+            Warn("%ls is missing from the game folder. Without it this bridge "
+                 "has nothing to hand the DLSS 5 add-on and will do nothing.", n);
     }
 
     // Everything else that could be taking part, so conflicts are visible.
@@ -859,6 +918,9 @@ static bool RegisterWithReShade(HMODULE self)
             {
                 g_unregister = reinterpret_cast<PFN_ReShadeUnregisterAddon>(
                     GetProcAddress(mods[i], "ReShadeUnregisterAddon"));
+                g_reshade_log = reinterpret_cast<PFN_ReShadeLogMessage>(
+                    GetProcAddress(mods[i], "ReShadeLogMessage"));
+                g_reshade_module = self;
                 return true;
             }
         }

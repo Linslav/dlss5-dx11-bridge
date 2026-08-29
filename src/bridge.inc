@@ -280,8 +280,8 @@ static bool BridgeBlitDepth(ID3D11DeviceContext *ctx, ID3D11Device *dev11, ID3D1
         {
             // Repeating this every frame produces hundreds of megabytes of log
             // and hides everything else, so say it once and stop trying.
-            Log("[bridge] cannot read the game's depth: format %u has no usable view "
-                "(tried %u, got 0x%08X).", sdesc.Format, view, hr);
+            Log("[bridge] cannot read this game's depth buffer (format %u); depth will not "
+                "reach DLSS. Please report this format.", sdesc.Format);
             Log("  Depth will not reach DLSS. Image quality will suffer, especially");
             Log("  around moving objects. Please report this format.");
             g_bridge.depth_converted = false;
@@ -778,8 +778,22 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt)
         }
     }
 
-    if (code != 0 || rf != NGX_SUCCESS || g_bridge.feature == nullptr)
-    { Log("[bridge] CreateFeature failed (result 0x%08X, exception 0x%08X)", rf, code); return false; }
+    if (code != 0)
+    {
+        // NGX loads its feature implementations from the game folder before the
+        // driver's copy. A stale or mismatched nvngx_*.dll there is the usual
+        // reason creating a feature faults rather than returning an error.
+        Warn("creating the DLSS feature crashed. If you copied any nvngx_*.dll into "
+             "the game folder by hand, a version mismatch there is the likeliest "
+             "cause -- try removing them.");
+        Log("  NGX prefers nvngx_*.dll files sitting next to the game over the");
+        Log("  driver's own. If any were dropped in by hand, a version mismatch");
+        Log("  there is the likeliest cause -- try removing them.");
+        g_bridge.disabled = true;
+        return false;
+    }
+    if (rf != NGX_SUCCESS || g_bridge.feature == nullptr)
+    { Log("[bridge] CreateFeature failed with result 0x%08X", rf); return false; }
 
     Log("[bridge] feature ready: render %ux%u -> output %ux%u  (textures in %ux%u out %ux%u) handle=%p",
         g_bridge.render_w, g_bridge.render_h, g_bridge.ngx_out_w, g_bridge.ngx_out_h,
@@ -868,7 +882,8 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
     // hang rather than as anything traceable to this add-on.
     if (ctx->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE)
     {
-        Log("[bridge] DLSS is being evaluated on a DEFERRED context.");
+        Log("[bridge] DLSS runs on a deferred context here; the bridge cannot work "
+            "and has stopped. The game is unaffected.");
         Log("  This bridge synchronises two APIs with a shared fence, and that only");
         Log("  works on the immediate context. Continuing would deadlock the render");
         Log("  thread, so the bridge is stopping. The game is unaffected.");
