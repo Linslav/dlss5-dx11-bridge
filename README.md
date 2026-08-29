@@ -149,13 +149,15 @@ without a conversation:
 
 ## Confirmed working
 
-Reported by users, on three unrelated engines:
+Reported by users, on four unrelated engines:
 
 - **Baldur's Gate 3** (Divinity 4.0) — tested in depth here, native DLSS, DLAA
   and every quality preset
 - **Fallout 4** (Creation) — DLSS supplied by a third-party injector rather
   than by the game
 - **7 Days to Die** (Unity)
+- **The Legend of Heroes: Trails beyond the Horizon** (Falcom) — needed both
+  fixes in 1.0.4 and 1.0.5, and is the reason they exist
 
 Fallout 4 matters for a second reason: it shows the bridge picks up DLSS that
 another mod provides, not only DLSS built into the game.
