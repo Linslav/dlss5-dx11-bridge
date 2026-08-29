@@ -38,7 +38,7 @@
 #include <cstdint>
 
 // Kept in step with version.rc, which is where ReShade's overlay reads it from.
-#define BRIDGE_VERSION "1.0.10"
+#define BRIDGE_VERSION "1.0.11"
 
 extern "C" __declspec(dllexport) const char *NAME =
     "DLSS 5 DX11 Bridge " BRIDGE_VERSION;
@@ -185,6 +185,10 @@ static void Breadcrumb(const char *what) { g_where = what; }
 
 static LPTOP_LEVEL_EXCEPTION_FILTER g_prev_filter;
 
+// Defined with the hook table below; a module unloaded after being hooked is
+// no longer a module, but its base is still recorded there.
+static void NameHookedLayerAt(const void *base, wchar_t *out, size_t cch);
+
 static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
 {
     const void *addr = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : nullptr;
@@ -199,6 +203,33 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                            static_cast<LPCWSTR>(addr), &mod) && mod != nullptr)
         GetModuleFileNameW(mod, owner, MAX_PATH);
+
+    // "unknown" on its own is not an answer, and it is the answer that arrives
+    // whenever the faulting code has been unloaded or was mapped without being
+    // registered as a module -- both of which say something specific.
+    if (mod == nullptr && addr != nullptr)
+    {
+        MEMORY_BASIC_INFORMATION mbi = {};
+        if (VirtualQuery(addr, &mbi, sizeof(mbi)) == sizeof(mbi))
+        {
+            if (mbi.State == MEM_FREE)
+                wcscpy_s(owner, L"memory that is no longer mapped -- the code that "
+                                L"faulted has been unloaded");
+            else
+            {
+                // A module hooked earlier can be unloaded while its base is still
+                // recorded here. GetModuleHandleEx finds nothing; the base does.
+                NameHookedLayerAt(mbi.AllocationBase, owner, MAX_PATH);
+
+                if (wcscmp(owner, L"unknown") == 0)
+                    if (HMODULE k32 = GetModuleHandleW(L"kernel32.dll"))
+                        if (auto mapped = reinterpret_cast<DWORD (WINAPI *)(HANDLE, LPVOID, LPWSTR, DWORD)>(
+                                GetProcAddress(k32, "K32GetMappedFileNameW")))
+                            if (mapped(GetCurrentProcess(), const_cast<void *>(addr), owner, MAX_PATH) == 0)
+                                wcscpy_s(owner, L"unknown");
+            }
+        }
+    }
 
     Log("");
     // A marker the next run looks for. Recording a crash when one actually
@@ -899,10 +930,26 @@ static int HookNewNgxModules()
             wcsstr(path, L"\\NGX\\models\\") != nullptr)
             continue;
 
-        // Some builds export both names at the same address. Patching one
-        // address twice would save the first patch as the second's original
-        // bytes and leave the function permanently redirected.
-        if (eval_c == eval) eval_c = nullptr;
+        // Two of these names arriving at one address means the module is not a
+        // real implementation: the driver's nvngx_dlssg.dll points both
+        // CreateFeature and EvaluateFeature at a six-byte "mov eax,1 ; ret"
+        // placeholder. Patching one address twice saves the first patch as the
+        // second's original bytes, so the function is redirected for good and
+        // the two detours receive each other's arguments -- which is what makes
+        // NGX fault while it is loading its own snippets.
+        //
+        // Skipping the module is right on both counts: the double patch cannot
+        // happen, and a stub that answers 1 to everything was never going to
+        // carry a DLSS call worth intercepting.
+        if ((eval != nullptr && eval == create) ||
+            (eval_c != nullptr && eval_c == create) ||
+            (eval != nullptr && eval == eval_c))
+        {
+            Log("  skipping %ls: it exports more than one NGX entry point at %p, so "
+                "it is a placeholder rather than an implementation.", leaf,
+                eval != nullptr ? eval : eval_c);
+            continue;
+        }
 
         const LONG slot = g_layer_count;
         Layer &L = g_layer[slot];
@@ -1116,6 +1163,40 @@ static void TryInstallHooks()
             "bridge cannot see it.");
 }
 
+// "DLSS is off, or the call goes somewhere else" leaves the reader to guess
+// which, and the two need completely different answers. NGX loads nvngx_dlss.dll
+// the moment DLSS actually starts, so its presence settles it: absent means DLSS
+// never started and the switch is off wherever it lives; present means DLSS did
+// start and is reaching NGX by a route these hooks do not sit on.
+//
+// The call counts separate a third case that looks the same from outside: a
+// feature created and then never evaluated is not the same failure as one that
+// was never created.
+static void SayWhyNothingCalled()
+{
+    Log("  CreateFeature calls: %ld, EvaluateFeature calls: %ld",
+        InterlockedCompareExchange(&g_create_count, 0, 0),
+        InterlockedCompareExchange(&g_eval_count, 0, 0));
+
+    if (GetModuleHandleW(L"nvngx_dlss.dll") == nullptr)
+    {
+        Log("  nvngx_dlss.dll was never loaded, so DLSS never started at all. It is");
+        Log("  switched off wherever it is configured -- in the game's own options,");
+        Log("  or in whatever mod supplies it. Nothing here can act before it runs.");
+    }
+    else if (InterlockedCompareExchange(&g_create_count, 0, 0) > 0)
+    {
+        Log("  A DLSS feature was created and then never evaluated. That is a");
+        Log("  different fault from DLSS not running: something started it and");
+        Log("  stopped before the first frame.");
+    }
+    else
+    {
+        Log("  nvngx_dlss.dll is loaded, so DLSS did start, but it reached NGX by a");
+        Log("  route these hooks do not sit on. Streamline and D3D12 both do that.");
+    }
+}
+
 // The "nothing ever called us" diagnosis used to be written only at unload, and
 // most games never run DLL detach -- so the one log that needed it said nothing.
 // Report it as soon as it is true instead. There is no timer thread to hang it
@@ -1130,16 +1211,55 @@ static void ReportIdle()
 
     Log("");
     Log("60 seconds after hooking, nothing has called DLSS through these entry points.");
-    Log("  Not a hooking problem. Either DLSS is off in the game's own settings, or");
-    Log("  whatever provides it does not use the D3D11 NGX exports -- Streamline and");
-    Log("  D3D12 both go elsewhere. The bridge only works from a D3D11 NGX call.");
+    SayWhyNothingCalled();
 }
 
-static void CALLBACK OnDllLoaded(ULONG reason, const void *, void *)
+// Both the loaded and unloaded notifications carry this shape.
+struct LdrDllNotificationData
 {
-    // 1 is LDR_DLL_NOTIFICATION_REASON_LOADED. This runs under the loader lock,
-    // so it does the least it can: a name lookup, and the hook writes.
+    ULONG       Flags;
+    const void *FullDllName;
+    const void *BaseDllName;
+    void       *DllBase;
+    ULONG       SizeOfImage;
+};
+
+// A hooked module can be unloaded while this add-on still holds the address of
+// a patched function and the bytes it saved from it. Calling through that
+// address afterwards lands in memory that is gone -- an access violation whose
+// address belongs to no module, which is exactly what Assetto Corsa reported.
+// Writing the saved bytes back is no better. Drop the layer instead.
+static void NameHookedLayerAt(const void *base, wchar_t *out, size_t cch)
+{
+    for (LONG i = 0; i < g_layer_count; ++i)
+        if (g_layer[i].mod != nullptr && static_cast<const void *>(g_layer[i].mod) == base)
+            _snwprintf_s(out, cch, _TRUNCATE,
+                         L"NGX layer %ld, no longer a registered module", i);
+}
+
+static void ForgetUnloadedLayer(const void *base)
+{
+    if (base == nullptr) return;
+    EnterCriticalSection(&g_hook_cs);
+    for (LONG i = 0; i < g_layer_count; ++i)
+    {
+        if (g_layer[i].mod == nullptr ||
+            static_cast<const void *>(g_layer[i].mod) != base) continue;
+        g_layer[i].eval.active = g_layer[i].eval_c.active = g_layer[i].create.active = false;
+        g_layer[i].mod = nullptr;
+        Log("NGX layer %ld has been unloaded; its hooks are dropped rather than "
+            "called into or written back to memory that is gone.", i);
+    }
+    LeaveCriticalSection(&g_hook_cs);
+}
+
+static void CALLBACK OnDllLoaded(ULONG reason, const void *data, void *)
+{
+    // 1 is LDR_DLL_NOTIFICATION_REASON_LOADED, 2 is UNLOADED. This runs under
+    // the loader lock, so it does the least it can.
     if (reason == 1) { TryInstallHooks(); ReportIdle(); }
+    else if (reason == 2 && data != nullptr)
+        ForgetUnloadedLayer(static_cast<const LdrDllNotificationData *>(data)->DllBase);
 }
 
 static void StartWatchingForNgx()
@@ -1183,8 +1303,7 @@ static void ReportOutcome()
     {
         Log("");
         Log("The entry points were hooked but nothing ever called DLSS through them.");
-        Log("  Not a hooking problem. Either DLSS is off in the game, or the call");
-        Log("  goes somewhere else.");
+        SayWhyNothingCalled();
     }
 }
 

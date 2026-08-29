@@ -29,6 +29,13 @@ struct Bridge
     bool session_ready;     // device, queue, fences, NGX session
     bool frame_ready;       // shared textures and NGX feature match the game
     bool msaa_reported;     // the MSAA notice is said once per spell of it
+
+    // The game's queue is made to wait for this fence value. A GPU-side wait
+    // cannot be cancelled, so the value it waits on is remembered here and
+    // checked on later frames; the fence can be signalled from the CPU, which
+    // releases the game even when the work behind it never arrives.
+    UINT64    pending_out;
+    ULONGLONG pending_since;
     int  consecutive_fails;
 
     ID3D12Device              *dev12;

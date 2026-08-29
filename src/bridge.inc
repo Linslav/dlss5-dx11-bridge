@@ -892,7 +892,8 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt,
         if (!is_depth && share_fmt != fmt[i])
             Log("[bridge] %s is %s; the shared copy uses %s, because nothing can view "
                 "a typeless texture", kSlotKey[i], FormatName(fmt[i]), FormatName(share_fmt));
-        // MV gets a UAV purely so it can be cleared for the isolation test.
+        // MV needs a UAV only on the fallback path, where a compute pass
+        // writes the shared copy instead of CopyResource.
         const bool        needs_uav  = is_depth || (i == SLOT_OUTPUT) || (i == SLOT_MV);
         const UINT        tw = (i == SLOT_OUTPUT) ? g_bridge.out_width  : w;
         const UINT        th = (i == SLOT_OUTPUT) ? g_bridge.out_height : h;
@@ -1130,6 +1131,39 @@ static bool BeginCommands()
     return SUCCEEDED(g_bridge.list->Reset(g_bridge.alloc[slot], nullptr));
 }
 
+// Frame N makes the game's queue wait for the D3D12 side to reach v_out. That
+// wait cannot be cancelled and has no timeout, so if the work behind it never
+// completes the game presents nothing ever again -- while its own loop, audio
+// and input carry on, which is what a frozen image with a live character is.
+// The 2 s check in BeginCommands cannot catch it: that code runs on the render
+// thread, and the render thread is what the block puts to sleep inside Present.
+//
+// So the value is remembered and checked on the frames that follow, while the
+// game is still submitting. Being behind by a frame or two is ordinary
+// pipelining and is what keeps the CPU free; being behind by half a second is
+// not. An ID3D12Fence can be signalled from the CPU, and that releases the
+// game's queue whether or not the work ever arrives.
+static void BridgeRescueStalledQueue()
+{
+    if (g_bridge.pending_out == 0 || g_bridge.fence12 == nullptr) return;
+
+    if (g_bridge.fence12->GetCompletedValue() >= g_bridge.pending_out)
+    {
+        g_bridge.pending_out = 0;
+        return;
+    }
+    if (GetTickCount64() - g_bridge.pending_since < 500) return;
+
+    Log("[bridge] the D3D12 side has not finished frame %llu after 500 ms, and the",
+        g_bridge.frames_done);
+    Log("  game's queue is waiting on it. Releasing that wait from the CPU so the");
+    Log("  game can present again. The neural pass runs inside that work, so");
+    Log("  whatever stopped is there rather than in the transport.");
+    g_bridge.fence12->Signal(g_bridge.pending_out);
+    g_bridge.pending_out = 0;
+    BridgeDisable("the D3D12 side stopped completing");
+}
+
 // Submits, then records which fence value retires the allocator just used.
 static UINT64 EndCommands()
 {
@@ -1177,6 +1211,7 @@ static void CopyUIntParam(const NVSDK_NGX_Parameter *src, const char *key, unsig
 
 static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter *gp)
 {
+    BridgeRescueStalledQueue();
     if (g_bridge.disabled || !g_bridge.session_ready || gp == nullptr) return;
 
     // Signal and Wait are immediate-context operations. On a deferred context
@@ -1417,8 +1452,17 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
     }
     else
     {
-        // 4. take the result back into the game's own output texture
+        // 4. take the result back into the game's own output texture.
+        //
+        // The wait stays on the GPU: moving it to the CPU costs about nine
+        // milliseconds a frame, because the CPU then stops instead of running
+        // ahead to prepare the next one. What it cannot stay is unattended --
+        // a GPU-side wait has no timeout and cannot be cancelled, so if the
+        // D3D12 side never reaches v_out the game's queue stops for good.
+        // BridgeRescueStalledQueue watches this value on later frames.
         g_bridge.ctx4->Wait(g_bridge.fence11, v_out);
+        g_bridge.pending_out   = v_out;
+        g_bridge.pending_since = GetTickCount64();
 
         const UINT64 n = ++g_bridge.frames_done;
 
