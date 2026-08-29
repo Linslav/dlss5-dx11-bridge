@@ -48,6 +48,14 @@ struct Bridge
     bool      pause_reported;
     bool      resume_reported;
 
+    // Counted across pauses and never reset, unlike rebuilds. A shape that
+    // settles produces one pause; a shape that never settles produces one every
+    // three seconds for the whole session, each preceded by eight rebuilds of
+    // four shared texture pairs and an NGX feature. The per-window counter
+    // cannot see that, by construction.
+    int       pause_cycles;
+    bool      msaa_cleared;
+
     // The feature covers only part of the output texture. Gallipoli's map screen
     // creates a 1440x1440 feature while its textures stay 2560x1440: it draws
     // into a square sub-region. Handing DLSS the whole texture for a feature

@@ -194,6 +194,17 @@ static void CfgPath(char *out)
 
 static void CfgReload()
 {
+    // Called from the frame path, which used to throttle on a frame counter that
+    // stops moving the moment the bridge stops delivering. A game that never
+    // delivers -- Watch Dogs 2 at MSAA -- then opened and parsed this file on the
+    // render thread every single frame, inside the lock the game's own threads
+    // contend for. The clock does not stop when the counter does.
+    // ponytail: one second, fixed; a per-caller rate only if one ever earns it.
+    static ULONGLONG last_read;
+    const ULONGLONG now = GetTickCount64();
+    if (last_read != 0 && now - last_read < 1000) return;
+    last_read = now;
+
     char path[MAX_PATH];
     CfgPath(path);
 
@@ -390,8 +401,36 @@ static void BridgeDisable(const char *why)
 // session could not be opened", which is false at all three call sites: every
 // one is downstream of the session_ready check, so the session had already
 // opened. The message pointed every bug report at the init code.
+// NGX answers in hex and nothing in this log said what the hex meant, so every
+// report cost a trip to nvsdk_ngx_defs.h -- the same tax the DRED breadcrumbs
+// charged until they were given names. Values are NVSDK_NGX_Result_Fail | n,
+// taken from that header.
+static const char *NgxResultName(NVSDK_NGX_Result r)
+{
+    if (r == NGX_SUCCESS) return "Success";
+    if ((static_cast<unsigned>(r) & 0xFFF00000u) != 0xBAD00000u) return "not an NGX result";
+    static const char *k[] = {
+        "Fail", "FeatureNotSupported", "PlatformError", "FeatureAlreadyExists",
+        "FeatureNotFound", "InvalidParameter", "ScratchBufferTooSmall",
+        "NotInitialized", "UnsupportedInputFormat", "RWFlagMissing", "MissingInput",
+        "UnableToInitializeFeature", "OutOfDate", "OutOfGPUMemory",
+        "UnsupportedFormat", "UnableToWriteToAppDataPath", "UnsupportedParameter",
+        "Denied", "NotImplemented",
+    };
+    const unsigned n = static_cast<unsigned>(r) & 0xFFFFFu;
+    return n < _countof(k) ? k[n] : "unknown";
+}
+
 static void BridgeFail(const char *what)
 {
+    // Clearing this on the first failure, not the third, is what keeps the
+    // promise BridgeWillDeliver makes. That decision is taken at the top of the
+    // evaluate, before this frame runs, so a frame_ready left standing through
+    // two more failures suppresses the game's own DLSS on frames into which
+    // nothing is then written. The counter still governs when to stop; it no
+    // longer governs whether the game may draw.
+    g_bridge.frame_ready = false;
+
     if (++g_bridge.consecutive_fails >= 3)
     {
         Log("[bridge] disabled after repeated failures (%s). Game rendering is untouched.", what);
@@ -897,7 +936,8 @@ static bool BridgeInitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
             NVSDK_NGX_Parameter *caps = nullptr;
             NVSDK_NGX_Result rc = SafeGetCaps(get_caps, &caps, &code);
             if (code != 0)              Log("[bridge] capability query raised 0x%08X", code);
-            else if (rc != NGX_SUCCESS) Log("[bridge] capability query failed 0x%08X", rc);
+            else if (rc != NGX_SUCCESS)
+                Log("[bridge] capability query failed 0x%08X, %s", rc, NgxResultName(rc));
             else if (caps != nullptr)   { Log("[bridge] NGX capabilities:"); DumpCapability(caps); }
         }
 
@@ -952,7 +992,7 @@ static bool BridgeInitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
 
         NVSDK_NGX_Result rp = SafeAllocParams(g_bridge.alloc_params, &g_bridge.params, &code);
         if (code != 0 || rp != NGX_SUCCESS || g_bridge.params == nullptr)
-        { Log("[bridge] AllocateParameters failed 0x%08X", rp); goto fail; }
+        { Log("[bridge] AllocateParameters failed 0x%08X, %s", rp, NgxResultName(rp)); goto fail; }
 
         // DRED reports a hung GPU by naming the command list and queue that
         // stopped. Unnamed objects come back as blanks, which is useless in a
@@ -1422,7 +1462,14 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt,
         return false;
     }
     if (rf != NGX_SUCCESS || g_bridge.feature == nullptr)
-    { Log("[bridge] CreateFeature failed with result 0x%08X", rf); return false; }
+    {
+        Log("[bridge] CreateFeature failed with result 0x%08X, %s", rf, NgxResultName(rf));
+        if (rf == static_cast<NVSDK_NGX_Result>(0xBAD0000B))
+            Log("[bridge]   NGX could not build the feature from the create "
+                "parameters above. Those are the width, height, output size, "
+                "creation flags and quality preset logged just before this line.");
+        return false;
+    }
 
     Log("[bridge] feature ready: render %ux%u -> output %ux%u  (textures in %ux%u out %ux%u) handle=%p",
         g_bridge.render_w, g_bridge.render_h, g_bridge.ngx_out_w, g_bridge.ngx_out_h,
@@ -1757,7 +1804,7 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
         return;
     }
 
-    if ((g_bridge.frames_done % 60) == 0) CfgReload();
+    CfgReload();   // rate limited inside, on the clock rather than on frames
 
     // Stage 0 touches nothing at all, not even a read of the game's parameters.
     if (g_cfg.stage <= 0) { ++g_bridge.frames_done; return; }
@@ -1800,10 +1847,15 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
         for (int i = 0; i < SLOT_COUNT; ++i) g[i]->Release();
         return;
     }
-    if (g_bridge.msaa_reported)
+    // This used to clear msaa_reported, so a game alternating sample counts
+    // re-armed the warning every other frame and the two messages traded places
+    // for as long as it lasted. Said once each, per session: the frame counter
+    // shows the rest.
+    if (g_bridge.msaa_reported && !g_bridge.msaa_cleared)
     {
-        g_bridge.msaa_reported = false;
-        Log("[bridge] MSAA is off now; rebuilding.");
+        g_bridge.msaa_cleared = true;
+        Log("[bridge] MSAA is off now; rebuilding. Further changes of sample count "
+            "are not reported.");
     }
 
     ID3D11Device *dev11 = nullptr;
@@ -1907,6 +1959,22 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
 
         if (++g_bridge.rebuilds > 8)
         {
+            // rebuilds is zeroed on every resume, so it can never reach a
+            // threshold that spans pauses. This one is not, and a shape that
+            // never settles stops costing eight rebuilds every three seconds
+            // for the rest of the session.
+            if (++g_bridge.pause_cycles >= 5)
+            {
+                Log("[bridge] the render shape has not settled across %d pauses. "
+                    "Continuing would rebuild eight times every three seconds for "
+                    "the rest of the session, so the bridge is stopping. The game "
+                    "is unaffected.", g_bridge.pause_cycles);
+                BridgeDisable("the render shape never settles");
+                for (int i = 0; i < SLOT_COUNT; ++i) g[i]->Release();
+                dev11->Release();
+                return;
+            }
+
             if (!g_bridge.pause_reported)
             {
                 Log("[bridge] the render shape has changed %d times in two seconds, so "
@@ -2028,8 +2096,14 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
     // Mirror the game's own subrect description rather than inventing one. In an
     // upscaling preset the rendered area is a corner of a larger texture, and
     // guessing it is what made DLSS Quality produce a soft, effect-free image.
-    MirrorUIntParam(gp, "DLSS.Render.Subrect.Dimensions.Width");
-    MirrorUIntParam(gp, "DLSS.Render.Subrect.Dimensions.Height");
+    // These two are not the game's to declare on our behalf: they state the size
+    // of the region THIS feature is being asked to process, and this bridge knows
+    // that exactly because it created the feature. Mirroring is right for MV.Scale
+    // and exposure, which describe the game's own data and are corrupted by any
+    // invention. It is wrong here, and 1.0.18 stopped sending them to a game that
+    // sets none -- taking information away from whatever reads the block after us.
+    CopyUIntParam(gp, "DLSS.Render.Subrect.Dimensions.Width", g_bridge.render_w);
+    CopyUIntParam(gp, "DLSS.Render.Subrect.Dimensions.Height", g_bridge.render_h);
     MirrorUIntParam(gp, "DLSS.Input.Color.Subrect.Base.X");
     MirrorUIntParam(gp, "DLSS.Input.Color.Subrect.Base.Y");
     MirrorUIntParam(gp, "DLSS.Input.Depth.Subrect.Base.X");
@@ -2084,7 +2158,7 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
     }
     else if (re != NGX_SUCCESS)
     {
-        Log("[bridge] evaluate failed with result 0x%08X", re);
+        Log("[bridge] evaluate failed with result 0x%08X, %s", re, NgxResultName(re));
         BridgeFail("evaluate");
     }
     else

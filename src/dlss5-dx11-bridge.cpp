@@ -39,7 +39,7 @@
 #pragma comment(lib, "version.lib")
 
 // Kept in step with version.rc, which is where ReShade's overlay reads it from.
-#define BRIDGE_VERSION "1.0.18"
+#define BRIDGE_VERSION "1.0.19"
 
 extern "C" __declspec(dllexport) const char *NAME =
     "DLSS 5 DX11 Bridge " BRIDGE_VERSION;
@@ -1259,6 +1259,28 @@ static int HookNewNgxModules()
         const wchar_t *leaf = wcsrchr(path, L'\\');
         leaf = leaf ? leaf + 1 : path;
 
+        // A game that links the NGX client statically exports these from its own
+        // executable, and hooking them writes into the game's code section. The
+        // Elder Scrolls Online does, and it is the only reported title that dies
+        // with no exception, no shutdown marker and a log that simply stops --
+        // which is what a process terminated by an integrity check looks like.
+        // Hold it back: the driver's loader and the feature snippet are hooked as
+        // their own layers and should carry the same calls. If nothing has called
+        // DLSS a minute later, ReportIdle un-rejects this and comes back.
+        if (mods[i] == GetModuleHandleW(nullptr) && !g_force_exe && g_cfg.skip_exe != 0)
+        {
+            Log("  holding off on %ls: it is the host executable rather than a "
+                "library, so its NGX entry points sit in the game's own code "
+                "section. The driver's loader and the feature snippet are hooked "
+                "as their own layers and should carry the same calls. If nothing "
+                "calls DLSS within a minute, this one is hooked after all rather "
+                "than leaving the add-on doing nothing.", leaf);
+            g_skipped_host_exe = true;
+            if (g_cfg.skip_exe == 1) g_deferred_exe = mods[i];
+            RememberRejected(mods[i]);
+            continue;
+        }
+
         // The downloaded models under ProgramData are DLLs that export the full
         // API too, but nothing ever calls them as an entry point. They would eat
         // layer slots the real callers need.
@@ -1488,25 +1510,6 @@ static void LogNgxCandidates()
         // as their own layers; ESO's log shows all three present. If a game ever
         // exposes NGX nowhere else, the idle diagnosis below says so and the
         // result is an add-on that does nothing rather than a dead game.
-        if (mods[i] == GetModuleHandleW(nullptr) && !g_force_exe)
-        {
-            if (g_cfg.skip_exe != 0)
-            {
-                Log("  holding off on %ls: it is the host executable rather than a "
-                    "library, so its NGX entry points sit in the game's own code "
-                    "section. The driver's loader and the feature snippet are "
-                    "hooked as their own layers and should carry the same calls. "
-                    "If nothing calls DLSS within a minute, this one is hooked "
-                    "after all rather than leaving the add-on doing nothing.", leaf);
-                g_skipped_host_exe = true;
-                if (g_cfg.skip_exe == 1) g_deferred_exe = mods[i];
-                RememberRejected(mods[i]);
-                continue;
-            }
-            Log("  %ls is the host executable, and skip_exe=0, so its own code "
-                "section is being patched.", leaf);
-        }
-
         Log("    %ls  ->%s%s%s%s", path, d3d11 ? " D3D11" : "", d3d12 ? " D3D12" : "",
             vk ? " VULKAN" : "",
             (!d3d11 && !d3d12 && !vk) ? " (no NGX exports)" : "");
@@ -1655,7 +1658,8 @@ static void RetractIdleNote()
 // all keeps loading DLLs.
 static void ReportIdle()
 {
-    if (InterlockedCompareExchange(&g_hooks_installed, 0, 0) == 0) return;
+    if (InterlockedCompareExchange(&g_hooks_installed, 0, 0) == 0 &&
+        g_deferred_exe == nullptr) return;
     if (g_eval_count != 0) return;
     if (GetTickCount64() - g_hook_time < 60000) return;
     if (InterlockedCompareExchange(&g_idle_reported, 1, 0) != 0) return;
@@ -1899,7 +1903,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         // prevent -- so the documented off switch still created a D3D12 device
         // and started an NGX session before anything looked at the file.
         CfgReload();
-        StartWatchingForNgx();
+            g_hook_time = GetTickCount64();
+    StartWatchingForNgx();
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
