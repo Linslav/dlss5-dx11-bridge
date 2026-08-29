@@ -38,7 +38,7 @@
 #include <cstdint>
 
 // Kept in step with version.rc, which is where ReShade's overlay reads it from.
-#define BRIDGE_VERSION "1.0.6"
+#define BRIDGE_VERSION "1.0.7"
 
 extern "C" __declspec(dllexport) const char *NAME =
     "DLSS 5 DX11 Bridge " BRIDGE_VERSION;
@@ -471,6 +471,15 @@ static NVSDK_NGX_Result SafeInitExt(PFN_Init_Ext fn, unsigned long long app_id,
 {
     *code = 0;
     __try { return fn(app_id, path, dev, ver, nullptr); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return NGX_EXCEPTION_MARKER; }
+}
+
+static NVSDK_NGX_Result SafeInitProjectID(PFN_Init_ProjectID fn, const char *project,
+                                          const wchar_t *path, ID3D12Device *dev, int ver,
+                                          DWORD *code)
+{
+    *code = 0;
+    __try { return fn(project, 0 /* ENGINE_TYPE_CUSTOM */, "1.0", path, dev, ver, nullptr); }
     __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return NGX_EXCEPTION_MARKER; }
 }
 

@@ -462,11 +462,38 @@ static bool BridgeInitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
         GetModuleFileNameW(g_self, data_path, MAX_PATH);
         if (wchar_t *s = wcsrchr(data_path, L'\\')) *(s + 1) = L'\0';
 
-        DWORD code = 0;
-        NVSDK_NGX_Result ri = SafeInitExt(init_ext, 0x1000000ULL, data_path, g_bridge.dev12,
-                                          0x13, &code);
-        if (code != 0 || ri != NGX_SUCCESS)
-        { Log("[bridge] NGX D3D12 init failed (result 0x%08X, exception 0x%08X)", ri, code); goto fail; }
+        // The SDK version constant is not documented and has moved between NGX
+        // releases, so it is negotiated rather than assumed. Hardcoding the one
+        // value that worked on the machine this was written on made the whole
+        // session fail on a different driver. Init_ProjectID is tried as well:
+        // some drivers accept one entry point and fault on the other.
+        auto init_project = reinterpret_cast<PFN_Init_ProjectID>(
+            GetProcAddress(ngx, "NVSDK_NGX_D3D12_Init_ProjectID"));
+
+        DWORD code   = 0;
+        bool  inited = false;
+        for (int ver = 0x13; ver <= 0x16 && !inited; ++ver)
+        {
+            if (init_ext != nullptr)
+            {
+                NVSDK_NGX_Result r = SafeInitExt(init_ext, 0x1000000ULL, data_path,
+                                                 g_bridge.dev12, ver, &code);
+                Log("[bridge] Init_Ext(version=0x%02X) -> %s", ver,
+                    code != 0 ? "faulted" : (r == NGX_SUCCESS ? "ok" : "refused"));
+                if (code == 0 && r == NGX_SUCCESS) { inited = true; break; }
+            }
+            if (init_project != nullptr)
+            {
+                NVSDK_NGX_Result r = SafeInitProjectID(init_project,
+                                                       "a0f57b54-1daf-4934-90ae-c4035c19df04",
+                                                       data_path, g_bridge.dev12, ver, &code);
+                Log("[bridge] Init_ProjectID(version=0x%02X) -> %s", ver,
+                    code != 0 ? "faulted" : (r == NGX_SUCCESS ? "ok" : "refused"));
+                if (code == 0 && r == NGX_SUCCESS) { inited = true; break; }
+            }
+        }
+        if (!inited)
+        { Log("[bridge] no NGX D3D12 init entry point was accepted by this driver"); goto fail; }
         Log("[bridge] NGX D3D12 session initialised");
 
         // What this GPU and driver will actually agree to run. Without it a
