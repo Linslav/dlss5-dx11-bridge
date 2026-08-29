@@ -183,11 +183,22 @@ static void LogCenterPixel(ID3D11DeviceContext *ctx, ID3D11Device *dev11,
     staging->Release();
 }
 
+// Every path that gives up goes through here, so the user is told once, in the
+// overlay, that the bridge stopped -- otherwise there is simply no effect on
+// screen and nothing to explain it without opening a file.
+static void BridgeDisable(const char *why)
+{
+    if (g_bridge.disabled) return;
+    g_bridge.disabled = true;
+    Warn("stopped: %s. The game renders normally. See dlss5-dx11-bridge.log "
+         "in the game folder for the detail.", why);
+}
+
 static void BridgeFail(const char *what)
 {
     if (++g_bridge.consecutive_fails >= 3)
     {
-        g_bridge.disabled = true;
+        BridgeDisable("the NGX session could not be opened");
         Log("[bridge] disabled after repeated failures (%s). Game rendering is untouched.", what);
     }
 }
@@ -537,7 +548,7 @@ static bool BridgeInitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
 
 fail:
     if (adapter != nullptr) adapter->Release();
-    g_bridge.disabled = true;
+    BridgeDisable("the D3D12 session failed to start");
     Log("[bridge] disabled. Game rendering is untouched.");
     Log("############# bridge: session failed #############");
     return false;
@@ -773,7 +784,7 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt)
         if (WaitForSingleObject(g_bridge.fence_event, 4000) != WAIT_OBJECT_0)
         {
             Log("[bridge] feature creation did not complete within 4 s; giving up.");
-            g_bridge.disabled = true;
+            BridgeDisable("creating the DLSS feature crashed");
             return false;
         }
     }
@@ -789,7 +800,7 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt)
         Log("  NGX prefers nvngx_*.dll files sitting next to the game over the");
         Log("  driver's own. If any were dropped in by hand, a version mismatch");
         Log("  there is the likeliest cause -- try removing them.");
-        g_bridge.disabled = true;
+        BridgeDisable("the DLSS feature could not be created");
         return false;
     }
     if (rf != NGX_SUCCESS || g_bridge.feature == nullptr)
@@ -821,7 +832,7 @@ static bool BeginCommands()
             Log("[bridge] the GPU did not retire allocator slot %d within 2 s.", slot);
             Log("  Something downstream is not completing. Stopping rather than");
             Log("  stalling the render thread any further.");
-            g_bridge.disabled = true;
+            BridgeDisable("the GPU stopped completing work");
             return false;
         }
     }
@@ -887,7 +898,7 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
         Log("  This bridge synchronises two APIs with a shared fence, and that only");
         Log("  works on the immediate context. Continuing would deadlock the render");
         Log("  thread, so the bridge is stopping. The game is unaffected.");
-        g_bridge.disabled = true;
+        BridgeDisable("DLSS runs on a deferred context here");
         return;
     }
 
@@ -1070,7 +1081,7 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
         // trustworthy. Retrying would likely take the game down, so stop here
         // and let it render on its own.
         Log("[bridge] evaluate raised exception 0x%08X -- disabling to protect the game", code);
-        g_bridge.disabled = true;
+        BridgeDisable("repeated failures");
     }
     else if (re != NGX_SUCCESS)
     {
