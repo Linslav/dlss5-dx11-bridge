@@ -100,23 +100,18 @@ and a timing line every 600 frames:
 
 ## Performance
 
-The cost is the neural-rendering work itself, not the transport. That much is
-reproducible: with the evaluate disabled but the D3D12 device, queue and
-allocators all created (`stage=2`), the frame time is indistinguishable from the
-add-on being fully inert (`stage=0`). CPU time inside this add-on is well under a
-millisecond per frame.
+- The transport costs nothing measurable. With the D3D12 device, queue and
+  allocators created but the evaluate disabled (`stage=2`), frame time matches
+  the add-on being fully inert (`stage=0`).
+- CPU time inside the add-on is well under a millisecond per frame. The rest is
+  the neural pass on the GPU.
+- How much that costs depends on scene, resolution, GPU and the DLSS 5 add-on's
+  own settings, and varies enough between areas of one game that a single figure
+  would mislead.
 
-How much the neural pass costs depends on the scene, the resolution, the GPU and
-the DLSS 5 add-on's own settings, and it varies enough between areas of the same
-game that a single number would mislead. Measure it where you play:
-
-- set `stage=0` in `dlss5-dx11-bridge.cfg`, stand still, read a timing line
-- set `stage=3`, do not move, read another
-
-The file is re-read while the game runs, so both readings come from one session
-and one spot. The timing line reports the frame interval and the spread between
-consecutive frames; the spread matters if a driver-side frame generator is
-interpolating between them.
+To measure it where you play: set `stage=0`, stand still, read a timing line;
+set `stage=3`, do not move, read another. The file is re-read while the game
+runs, so both come from one spot in one session.
 
 ## Related
 
