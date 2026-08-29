@@ -170,7 +170,7 @@ without a conversation:
 
 ## Confirmed working
 
-Reported by users, across six unrelated engines:
+Reported by users, across seven unrelated engines:
 
 | Title | Engine | DLSS from |
 | --- | --- | --- |
@@ -182,6 +182,7 @@ Reported by users, across six unrelated engines:
 | **Skyrim Special Edition** | Creation | a DLSS injector mod |
 | **Fallout 4** | Creation | a DLSS injector mod |
 | **S.T.A.L.K.E.R. Anomaly** | X-Ray | an upscaler injector mod (SSS24) |
+| **Assetto Corsa** | kunOS | Custom Shaders Patch (Preview 338 or later) |
 
 The last three matter for a second reason: they show the bridge picks up DLSS
 that another mod provides, not only DLSS built into the game. Those setups reach
