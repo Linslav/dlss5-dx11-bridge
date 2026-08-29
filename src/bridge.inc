@@ -57,16 +57,24 @@ static void TimingTick(LONGLONG entry, LONGLONG exit)
     }
 
     g_bridge.cpu_ticks += (exit - entry);
-    g_bridge.last_entry = entry;
     if (++g_bridge.timed_frames < 600) return;
 
     const double span_ms = 1000.0 * double(exit - g_bridge.span_start) / double(g_bridge.qpf);
     const double cpu_ms  = 1000.0 * double(g_bridge.cpu_ticks) / double(g_bridge.qpf);
     const double n       = double(g_bridge.timed_frames);
 
+    // How far behind the D3D12 side is running. The game's queue is made to wait
+    // for these values, so a gap that grows instead of staying at a frame or two
+    // is the transport stalling -- and the last line before a log stops dead is
+    // then evidence rather than an inference.
+    const UINT64 done = g_bridge.fence12 != nullptr
+                      ? g_bridge.fence12->GetCompletedValue() : 0;
+
     Log("[bridge] %.0f frames: bridge CPU %.2f ms/frame | frame interval %.2f ms (%.1f fps) "
-        "| bridge is %.0f%% of the frame",
-        n, cpu_ms / n, span_ms / n, 1000.0 / (span_ms / n), 100.0 * cpu_ms / span_ms);
+        "| bridge is %.0f%% of the frame | d3d12 %llu/%llu (%lld behind)",
+        n, cpu_ms / n, span_ms / n, 1000.0 / (span_ms / n), 100.0 * cpu_ms / span_ms,
+        done, g_bridge.fence_value,
+        static_cast<long long>(g_bridge.fence_value) - static_cast<long long>(done));
 
     g_bridge.cpu_ticks    = 0;
     g_bridge.timed_frames = 0;
@@ -186,20 +194,43 @@ static void LogCenterPixel(ID3D11DeviceContext *ctx, ID3D11Device *dev11,
 // Every path that gives up goes through here, so the user is told once, in the
 // overlay, that the bridge stopped -- otherwise there is simply no effect on
 // screen and nothing to explain it without opening a file.
+static void BridgeReleaseTextures();
+
+// It is also the only shutdown this add-on has. It used to set a flag and
+// nothing else, which left the DLSS feature, four shared textures and their NT
+// handles resident for the rest of the session -- while telling the user the
+// game was rendering normally.
 static void BridgeDisable(const char *why)
 {
     if (g_bridge.disabled) return;
     g_bridge.disabled = true;
     Warn("stopped: %s. The game renders normally. See dlss5-dx11-bridge.log "
          "in the game folder for the detail.", why);
+
+    // Before anything else. The game's queue may be waiting on a fence value
+    // this side will never reach, and a fence can be signalled from the CPU.
+    // Releasing it first also lets the drain below complete, because the D3D12
+    // queue is waiting on a signal that the blocked queue owes it.
+    if (g_bridge.pending_out != 0 && g_bridge.fence12 != nullptr)
+    {
+        Log("[bridge] releasing the game's queue from fence %llu on the way out.",
+            g_bridge.pending_out);
+        g_bridge.fence12->Signal(g_bridge.pending_out);
+        g_bridge.pending_out = 0;
+    }
+    BridgeReleaseTextures();
 }
 
+// The reason reaches the user unchanged. It used to be replaced with "the NGX
+// session could not be opened", which is false at all three call sites: every
+// one is downstream of the session_ready check, so the session had already
+// opened. The message pointed every bug report at the init code.
 static void BridgeFail(const char *what)
 {
     if (++g_bridge.consecutive_fails >= 3)
     {
-        BridgeDisable("the NGX session could not be opened");
         Log("[bridge] disabled after repeated failures (%s). Game rendering is untouched.", what);
+        BridgeDisable(what);
     }
 }
 
@@ -851,7 +882,14 @@ static bool MakeSharedPair(ID3D11Device *dev11, ID3D11Device1 *dev1, int i,
         hr = g_bridge.dev12->OpenSharedHandle(g_bridge.shared[i], __uuidof(ID3D12Resource),
                                               reinterpret_cast<void **>(&g_bridge.tex12[i]));
     if (FAILED(hr))
-    { Log("[bridge] %s: D3D11->D3D12 path failed 0x%08X", kSlotName[i], hr); return false; }
+    {
+        Log("[bridge] %s: D3D11->D3D12 path failed 0x%08X", kSlotName[i], hr);
+        // The caller may retry this slot with another format, and the retry
+        // overwrites both pointers. Let go of them here or they are lost.
+        if (g_bridge.tex11[i]  != nullptr) { g_bridge.tex11[i]->Release();  g_bridge.tex11[i]  = nullptr; }
+        if (g_bridge.shared[i] != nullptr) { CloseHandle(g_bridge.shared[i]); g_bridge.shared[i] = nullptr; }
+        return false;
+    }
 
     Log("[bridge] %-6s %ux%u fmt=%u  via D3D11->D3D12  d3d12=%p d3d11=%p",
         kSlotName[i], w, h, fmt, static_cast<void *>(g_bridge.tex12[i]),
@@ -895,8 +933,14 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt,
         // MV needs a UAV only on the fallback path, where a compute pass
         // writes the shared copy instead of CopyResource.
         const bool        needs_uav  = is_depth || (i == SLOT_OUTPUT) || (i == SLOT_MV);
-        const UINT        tw = (i == SLOT_OUTPUT) ? g_bridge.out_width  : w;
-        const UINT        th = (i == SLOT_OUTPUT) ? g_bridge.out_height : h;
+        // Every mirror is sized from the texture it mirrors. Depth and motion
+        // vectors used to be sized from Color, which is only correct while all
+        // three agree: a game supplying display-resolution motion vectors -- the
+        // configuration the MVLowRes create flag exists to distinguish -- got a
+        // Color-sized mirror, CopyResource silently refused the mismatch, and
+        // DLSS then read a motion-vector texture nobody had ever written.
+        const UINT        tw = g_bridge.slot_w[i];
+        const UINT        th = g_bridge.slot_h[i];
 
         bool made = MakeSharedPair(dev11, dev1, i, tw, th, share_fmt, needs_uav);
 
@@ -1145,22 +1189,35 @@ static bool BeginCommands()
 // game's queue whether or not the work ever arrives.
 static void BridgeRescueStalledQueue()
 {
-    if (g_bridge.pending_out == 0 || g_bridge.fence12 == nullptr) return;
+    if (g_bridge.fence12 == nullptr) return;
 
-    if (g_bridge.fence12->GetCompletedValue() >= g_bridge.pending_out)
+    const UINT64 done = g_bridge.fence12->GetCompletedValue();
+    const ULONGLONG now = GetTickCount64();
+
+    // The only honest measure of "the GPU stopped completing" is that the
+    // completed value has stopped moving. Being a frame or two behind is
+    // pipelining and is the state this bridge is built to keep; two earlier
+    // attempts here timed the wrong quantity and were wrong in both directions
+    // -- one that could never fire while frames arrived, then one that fired
+    // while Baldur's Gate 3 was zero frames behind at 120 fps.
+    if (done != g_bridge.last_completed)
     {
-        g_bridge.pending_out = 0;
+        g_bridge.last_completed = done;
+        g_bridge.pending_since  = now;
+        if (g_bridge.pending_out != 0 && done >= g_bridge.pending_out)
+            g_bridge.pending_out = 0;
         return;
     }
-    if (GetTickCount64() - g_bridge.pending_since < 500) return;
 
-    Log("[bridge] the D3D12 side has not finished frame %llu after 500 ms, and the",
-        g_bridge.frames_done);
-    Log("  game's queue is waiting on it. Releasing that wait from the CPU so the");
-    Log("  game can present again. The neural pass runs inside that work, so");
-    Log("  whatever stopped is there rather than in the transport.");
-    g_bridge.fence12->Signal(g_bridge.pending_out);
-    g_bridge.pending_out = 0;
+    // Nothing outstanding means nothing to rescue, however long it has been.
+    if (g_bridge.pending_out == 0 || done >= g_bridge.pending_out) return;
+    if (now - g_bridge.pending_since < 500) return;
+
+    Log("[bridge] the D3D12 side has completed nothing for 500 ms while the game's");
+    Log("  queue waits on fence %llu (completed %llu). Releasing that wait from the",
+        g_bridge.pending_out, done);
+    Log("  CPU so the game can present again. The neural pass runs inside that work,");
+    Log("  so whatever stopped is there rather than in the transport.");
     BridgeDisable("the D3D12 side stopped completing");
 }
 
@@ -1292,14 +1349,52 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
     if (gw == 0 || gh == 0) { gw = d[SLOT_COLOR].Width;  gh = d[SLOT_COLOR].Height; }
     if (gow == 0 || goh == 0) { gow = d[SLOT_OUTPUT].Width; goh = d[SLOT_OUTPUT].Height; }
 
-    bool shape_changed = (d[SLOT_COLOR].Width  != g_bridge.width)     ||
-                         (d[SLOT_COLOR].Height != g_bridge.height)    ||
-                         (d[SLOT_OUTPUT].Width != g_bridge.out_width) ||
-                         (d[SLOT_OUTPUT].Height!= g_bridge.out_height)||
-                         (gw != g_bridge.render_w)  || (gh != g_bridge.render_h) ||
+    // DLSS never produces an image smaller than the one it is given, so an
+    // output size below the render size is not a contract -- it is a mistake in
+    // the block. Gallipoli reports 2560x1440 in and 1485x835 out, which is the
+    // Balanced render size written into the output fields; NGX answers
+    // 0xBAD00005 and the bridge used to rebuild every texture, fail, and repeat
+    // until three failures switched it off.
+    //
+    // The output texture is an allocation rather than a claim, so when the two
+    // disagree this way the texture wins.
+    if (gow < gw || goh < gh)
+    {
+        static bool said = false;
+        if (!said)
+        {
+            said = true;
+            Log("[bridge] the game asks for an output of %ux%u from an input of %ux%u, "
+                "which is smaller rather than larger.", gow, goh, gw, gh);
+            Log("  Its output texture is %ux%u, and a texture is an allocation rather "
+                "than a claim, so that is used instead.",
+                d[SLOT_OUTPUT].Width, d[SLOT_OUTPUT].Height);
+        }
+        gow = d[SLOT_OUTPUT].Width;
+        goh = d[SLOT_OUTPUT].Height;
+    }
+
+    // If even the texture cannot satisfy it, nothing here can: say so once and
+    // stop, rather than hand NGX parameters it will refuse on every frame.
+    if (gow < gw || goh < gh)
+    {
+        Warn("this game's DLSS output (%ux%u) is smaller than its input (%ux%u). "
+             "The bridge cannot work from that and has stopped. The game is unaffected.",
+             gow, goh, gw, gh);
+        BridgeDisable("the game's output is smaller than its input");
+        for (int i = 0; i < SLOT_COUNT; ++i) g[i]->Release();
+        dev11->Release();
+        return;
+    }
+
+    bool shape_changed = (gw != g_bridge.render_w)  || (gh != g_bridge.render_h) ||
                          (gow != g_bridge.ngx_out_w) || (goh != g_bridge.ngx_out_h);
+    // Every slot's own size, not only Color's and Output's. Depth or motion
+    // vectors changing size on their own used to move nothing here.
     for (int i = 0; i < SLOT_COUNT && !shape_changed; ++i)
-        shape_changed = (d[i].Format != g_bridge.fmt[i]);
+        shape_changed = (d[i].Format != g_bridge.fmt[i]) ||
+                        (d[i].Width  != g_bridge.slot_w[i]) ||
+                        (d[i].Height != g_bridge.slot_h[i]);
 
     if (!g_bridge.frame_ready || shape_changed)
     {
@@ -1309,6 +1404,8 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
         g_bridge.height     = d[SLOT_COLOR].Height;
         g_bridge.out_width  = d[SLOT_OUTPUT].Width;
         g_bridge.out_height = d[SLOT_OUTPUT].Height;
+        for (int i = 0; i < SLOT_COUNT; ++i)
+        { g_bridge.slot_w[i] = d[i].Width; g_bridge.slot_h[i] = d[i].Height; }
         g_bridge.render_w   = gw;
         g_bridge.render_h   = gh;
         g_bridge.ngx_out_w  = gow;
@@ -1443,7 +1540,7 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
         // trustworthy. Retrying would likely take the game down, so stop here
         // and let it render on its own.
         Log("[bridge] evaluate raised exception 0x%08X -- disabling to protect the game", code);
-        BridgeDisable("repeated failures");
+        BridgeDisable("NGX raised an exception inside the D3D12 evaluate");
     }
     else if (re != NGX_SUCCESS)
     {
@@ -1461,8 +1558,11 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
         // D3D12 side never reaches v_out the game's queue stops for good.
         // BridgeRescueStalledQueue watches this value on later frames.
         g_bridge.ctx4->Wait(g_bridge.fence11, v_out);
-        g_bridge.pending_out   = v_out;
-        g_bridge.pending_since = GetTickCount64();
+        // Always the newest value: fences are monotonic, so signalling the
+        // latest satisfies every wait queued behind it. The deadline is not
+        // armed here -- BridgeRescueStalledQueue keeps it, against the last time
+        // the GPU completed anything at all.
+        g_bridge.pending_out = v_out;
 
         const UINT64 n = ++g_bridge.frames_done;
 

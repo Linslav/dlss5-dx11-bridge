@@ -38,7 +38,7 @@
 #include <cstdint>
 
 // Kept in step with version.rc, which is where ReShade's overlay reads it from.
-#define BRIDGE_VERSION "1.0.11"
+#define BRIDGE_VERSION "1.0.12"
 
 extern "C" __declspec(dllexport) const char *NAME =
     "DLSS 5 DX11 Bridge " BRIDGE_VERSION;
@@ -706,6 +706,10 @@ static void DumpCapability(NVSDK_NGX_Parameter *caps)
 // Detours
 // ---------------------------------------------------------------------------
 
+// Defined with the idle report it withdraws.
+static void RetractIdleNote();
+static void TryInstallHooks();
+
 static volatile LONG g_eval_count   = 0;
 static volatile LONG g_create_count = 0;
 
@@ -755,6 +759,12 @@ static NVSDK_NGX_Result ForwardEvaluate(Hook &h, const char *tag, ID3D11DeviceCo
     }
 
     const LONG n = InterlockedIncrement(&g_eval_count);
+    if (n == 1) RetractIdleNote();
+
+    // The loader notification is allowed to give up rather than block, so a
+    // module can be missed. This is the same scan from the render thread, where
+    // no loader lock is held and giving up costs nothing.
+    if ((n % 600) == 0) TryInstallHooks();
     if (n <= 5 || (n % 1800) == 0)
     {
         Log("  (entry point: %s)", tag);
@@ -821,8 +831,31 @@ static NVSDK_NGX_Result ForwardCreate(Hook &h, ID3D11DeviceContext *ctx, int fea
     }
     NestGuard nest;
 
+    // Same guard as the evaluate path, which had it and this did not. A detour
+    // entered from something that is not a call to it arrives with whatever was
+    // in the registers, and the bottom 64 KB of the address space is never
+    // mapped, so an argument below it cannot be real.
+    if (reinterpret_cast<uintptr_t>(p) < 0x10000 ||
+        reinterpret_cast<uintptr_t>(ctx) < 0x10000)
+    {
+        static LONG said = 0;
+        if (InterlockedCompareExchange(&said, 1, 0) == 0)
+            Log("[bridge] a create arrived with params=%p ctx=%p -- neither can be real. "
+                "Forwarding it untouched and ignoring it.",
+                static_cast<void *>(p), static_cast<void *>(ctx));
+
+        EnterCriticalSection(&g_hook_cs);
+        HookRemove(h);
+        NVSDK_NGX_Result bogus =
+            reinterpret_cast<PFN_Create>(h.target)(ctx, feature_id, p, out);
+        HookRestore(h);
+        LeaveCriticalSection(&g_hook_cs);
+        return bogus;
+    }
+
     Breadcrumb("forwarding the game's DLSS create");
     const LONG n = InterlockedIncrement(&g_create_count);
+    if (n == 1) RetractIdleNote();
     Log("=== CreateFeature #%ld  feature_id=%d ===", n, feature_id);
     DumpContext(ctx);
     if (p != nullptr)
@@ -905,6 +938,22 @@ typedef BOOL (WINAPI *PFN_EnumProcessModules)(HANDLE, HMODULE *, DWORD, LPDWORD)
 // caller would enter. That reasoning was wrong for Trails (hooked too low) and
 // wrong for Skyrim (hooked too high). The layers are indistinguishable from the
 // outside, so all of them are hooked and g_nest decides at call time.
+// An entry point whose first fourteen bytes are one filler byte repeated has no
+// code there: 0x90 is nop and 0xCC is int3, and no real function begins with
+// fourteen of either. The driver's nvngx.dll -- the redirector, not the loader
+// _nvngx.dll -- exports two NGX names into such sleds, at addresses that are not
+// even function-aligned. Writing a fourteen-byte jump into padding corrupts
+// whatever the padding belongs to.
+static bool IsFillerStub(const void *fn)
+{
+    if (fn == nullptr) return false;
+    const BYTE *p = static_cast<const BYTE *>(fn);
+    if (p[0] != 0x90 && p[0] != 0xCC) return false;
+    for (int i = 1; i < 14; ++i)
+        if (p[i] != p[0]) return false;
+    return true;
+}
+
 static void LogPrologue(const char *label, const BYTE *p);
 
 static int HookNewNgxModules()
@@ -937,6 +986,8 @@ static int HookNewNgxModules()
         void *create = reinterpret_cast<void *>(GetProcAddress(mods[i], "NVSDK_NGX_D3D11_CreateFeature"));
         if (create == nullptr || (eval == nullptr && eval_c == nullptr)) continue;
 
+        const bool filler = IsFillerStub(create) || IsFillerStub(eval) || IsFillerStub(eval_c);
+
         bool known = false;
         for (LONG k = 0; k < g_layer_count && !known; ++k)
             known = (g_layer[k].mod == mods[i]);
@@ -966,6 +1017,12 @@ static int HookNewNgxModules()
         // Skipping the module is right on both counts: the double patch cannot
         // happen, and a stub that answers 1 to everything was never going to
         // carry a DLSS call worth intercepting.
+        if (filler)
+        {
+            Log("  skipping %ls: its NGX entry points are filler bytes, not code.", leaf);
+            continue;
+        }
+
         if ((eval != nullptr && eval == create) ||
             (eval_c != nullptr && eval_c == create) ||
             (eval != nullptr && eval == eval_c))
@@ -1035,6 +1092,15 @@ static void LogEnvironment()
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     Log("  host: %ls", exe);
 
+    // Whose D3D11 this is. A wrapper in the game folder -- ENB, a proxy -- sits
+    // underneath everything else here, and is worth naming in any title rather
+    // than guessed at from a filename check.
+    {
+        wchar_t d3d[MAX_PATH] = {};
+        if (GetModuleFileNameW(GetModuleHandleW(L"d3d11.dll"), d3d, MAX_PATH) != 0)
+            Log("  d3d11.dll: %ls", d3d);
+    }
+
     if (HMODULE nt = GetModuleHandleW(L"ntdll.dll"))
     {
         if (auto rtl = reinterpret_cast<PFN_RtlGetVersion>(GetProcAddress(nt, "RtlGetVersion")))
@@ -1057,14 +1123,17 @@ static void LogNeighbours()
     GetModuleFileNameW(g_self, dir, MAX_PATH);
     if (wchar_t *s = wcsrchr(dir, L'\\')) *(s + 1) = L'\0';
 
+    // Only NVIDIA's own model files are named here. The DLSS 5 add-on's filename
+    // belongs to its author and is not this add-on's to require: the listing of
+    // every *.addon* below already shows what is present, and a red error in the
+    // overlay naming one particular file is wrong for anyone using another.
     static const wchar_t *needed[] = {
-        L"renodx-dlss5.addon64",   // the add-on that does the neural rendering
-        L"nvngx_dlssnr.dll",       // the model it loads
+        L"nvngx_dlssnr.dll",       // the neural-rendering model
         L"nvngx_dlss.dll",         // optional, a newer super-resolution model
     };
 
     Log("  files next to this add-on:");
-    for (int i = 0; i < 3; ++i)
+    for (int i = 0; i < 2; ++i)
     {
         const wchar_t *n = needed[i];
         wchar_t p[MAX_PATH];
@@ -1073,12 +1142,11 @@ static void LogNeighbours()
         const bool here = GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES;
         Log("    %-26ls %s", n, here ? "present" : "MISSING");
 
-        // The first two are required. Missing either means nothing will happen
-        // and no amount of staring at this add-on will explain why, so it is
-        // raised where the user will actually see it.
-        if (!here && i < 2)
-            Warn("%ls is missing from the game folder. Without it this bridge "
-                 "has nothing to hand the DLSS 5 add-on and will do nothing.", n);
+        // The model file is NVIDIA's, and its name is fixed by NVIDIA rather than
+        // by anyone's add-on, so its absence can be raised where it is seen.
+        if (!here && i == 0)
+            Warn("%ls is missing from the game folder. The DLSS 5 add-on loads its "
+                 "neural-rendering model from that file.", n);
     }
 
     // Everything else that could be taking part, so conflicts are visible.
@@ -1170,7 +1238,17 @@ static void TryInstallHooks()
     // initialises, so every load is another chance to find a layer.
     if (g_layer_count >= kMaxLayers) return;
 
-    EnterCriticalSection(&g_hook_cs);
+    // This runs from the loader notification, holding the loader lock. The same
+    // critical section is held by a detour across the forwarded NGX call -- and
+    // NGX loads its snippets from inside those calls, which is how layers 3, 4
+    // and 5 appear mid-session in every log. Blocking here would then be: this
+    // thread holds the loader lock and waits for the section, while the thread
+    // holding the section waits for the loader lock inside NGX. Nothing crashes,
+    // nothing is logged, and every frame stops.
+    //
+    // So it never blocks. A module missed now is picked up on the next library
+    // load or the next frame; a deadlock is forever.
+    if (!TryEnterCriticalSection(&g_hook_cs)) return;
     const int added = HookNewNgxModules();
     LeaveCriticalSection(&g_hook_cs);
     if (added == 0) return;
@@ -1179,13 +1257,17 @@ static void TryInstallHooks()
 
     g_hook_time = GetTickCount64();
 
-    // Streamline is a second, parallel way to reach DLSS. A game or mod using it
-    // never calls the functions above, so the hooks are in and nothing arrives --
-    // which looks identical to DLSS simply being switched off. Say which it is.
+    // Streamline is a second way to reach DLSS, and it was thought to be out of
+    // reach: it does not call the game's own NGX exports. It does, however, link
+    // NVIDIA's NGX D3D11 client inside sl.common.dll and call
+    // NVSDK_NGX_D3D11_EvaluateFeature on the feature snippet -- a module hooked
+    // since every layer became a target, so the call does arrive here. Worth
+    // recording because the call then comes from Streamline rather than from the
+    // game, and the parameter block is Streamline's.
     if (GetModuleHandleW(L"sl.interposer.dll") != nullptr)
-        Log("  sl.interposer.dll is loaded here, so DLSS in this game may go through "
-            "Streamline instead. Streamline does not call the functions above and the "
-            "bridge cannot see it.");
+        Log("  sl.interposer.dll is loaded, so DLSS here is driven through Streamline. "
+            "It reaches NGX through the feature snippet, which is hooked, so the calls "
+            "below come from Streamline's own NGX client rather than from the game.");
 }
 
 // "DLSS is off, or the call goes somewhere else" leaves the reader to guess
@@ -1203,11 +1285,19 @@ static void SayWhyNothingCalled()
         InterlockedCompareExchange(&g_create_count, 0, 0),
         InterlockedCompareExchange(&g_eval_count, 0, 0));
 
+    const bool streamline = GetModuleHandleW(L"sl.interposer.dll") != nullptr;
+
     if (GetModuleHandleW(L"nvngx_dlss.dll") == nullptr)
     {
-        Log("  nvngx_dlss.dll was never loaded, so DLSS never started at all. It is");
-        Log("  switched off wherever it is configured -- in the game's own options,");
-        Log("  or in whatever mod supplies it. Nothing here can act before it runs.");
+        Log("  nvngx_dlss.dll is not loaded, so no DLSS model has been asked for yet.");
+        if (streamline)
+            Log("  sl.interposer.dll is, so an upscaler runtime is initialised and idle.");
+        // What is absent is a fact; why it is absent is not one this process can
+        // see. It used to say "it is switched off wherever it is configured",
+        // which is false for a game started without its script extender, where
+        // nothing is switched off and the plugin simply never loaded.
+        Log("  Something has to ask for upscaling before anything here can run: the");
+        Log("  game's own setting, a mod's setting, or the mod not having loaded.");
     }
     else if (InterlockedCompareExchange(&g_create_count, 0, 0) > 0)
     {
@@ -1215,11 +1305,38 @@ static void SayWhyNothingCalled()
         Log("  different fault from DLSS not running: something started it and");
         Log("  stopped before the first frame.");
     }
+    else if (streamline)
+    {
+        Log("  Streamline and a DLSS model are both loaded, so the upscaler is running");
+        Log("  and nothing has asked it to upscale a frame.");
+        Log("  Where an upscaler replaces the engine's own temporal antialiasing -- which");
+        Log("  is how the Skyrim and Fallout mods work -- that is what a disabled TAA");
+        Log("  setting looks like from here. This add-on cannot read that setting; it can");
+        Log("  only say that the upscaler is idle.");
+    }
     else
     {
-        Log("  nvngx_dlss.dll is loaded, so DLSS did start, but it reached NGX by a");
-        Log("  route these hooks do not sit on. Streamline and D3D12 both do that.");
+        Log("  nvngx_dlss.dll is loaded, so NGX has initialised something. That is not");
+        Log("  the same as the game rendering: a menu, a lobby or a loading screen can");
+        Log("  sit here for minutes before the first DLSS call. If a level was already");
+        Log("  running, then DLSS is reaching NGX somewhere these hooks do not sit --");
+        Log("  a D3D12 path would do that. Streamline would not: it calls the same");
+        Log("  D3D11 entry points, on the snippet, and those are hooked.");
     }
+}
+
+// The note above is written on a timer and can be wrong: Escape from Tarkov
+// produced it from the menu and then called DLSS twenty-three seconds later.
+// A log that corrects itself is worth more than one that states a conclusion
+// and leaves it standing.
+static void RetractIdleNote()
+{
+    if (InterlockedCompareExchange(&g_idle_reported, 0, 0) == 0) return;
+    static LONG done = 0;
+    if (InterlockedCompareExchange(&done, 1, 0) != 0) return;
+    Log("");
+    Log("Disregard the note above: DLSS has now called through these entry points.");
+    Log("  It had simply not started yet when that was written.");
 }
 
 // The "nothing ever called us" diagnosis used to be written only at unload, and
@@ -1265,7 +1382,10 @@ static void NameHookedLayerAt(const void *base, wchar_t *out, size_t cch)
 static void ForgetUnloadedLayer(const void *base)
 {
     if (base == nullptr) return;
-    EnterCriticalSection(&g_hook_cs);
+    // Also reached under the loader lock; see TryInstallHooks. Missing an unload
+    // costs a stale record, which the crash reporter can name. Blocking costs
+    // the process.
+    if (!TryEnterCriticalSection(&g_hook_cs)) return;
     for (LONG i = 0; i < g_layer_count; ++i)
     {
         if (g_layer[i].mod == nullptr ||
@@ -1452,6 +1572,15 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
     {
         // Stop being told about new libraries before anything else, so no
         // callback can arrive while the rest of this is tearing down.
+        // Before anything else that can fault. This filter is process-wide and
+        // points into this module; leaving it installed after an unload sends
+        // the next unhandled exception anywhere in the process -- game, driver,
+        // another add-on -- into memory that is gone.
+        if (g_prev_filter != nullptr)
+        {
+            SetUnhandledExceptionFilter(g_prev_filter);
+            g_prev_filter = nullptr;
+        }
         StopWatchingForNgx();
         ReportOutcome();
 
@@ -1467,8 +1596,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         LeaveCriticalSection(&g_hook_cs);
         if (g_unregister != nullptr) g_unregister(g_self);
 
-        // The marker the next run looks for. Its absence is what says the last
-        // session ended abruptly rather than by quitting.
+        // Kept as a human-readable end-of-session marker only. Nothing reads it:
+        // inferring a crash from its absence is what 1.0.9 removed, because most
+        // games never run detach at all.
         Log("shut down cleanly.");
     }
     return TRUE;

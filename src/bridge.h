@@ -34,6 +34,12 @@ struct Bridge
     // cannot be cancelled, so the value it waits on is remembered here and
     // checked on later frames; the fence can be signalled from the CPU, which
     // releases the game even when the work behind it never arrives.
+    // Each slot's own dimensions, so a mirror is never sized from another
+    // slot's texture.
+    UINT      slot_w[4];
+    UINT      slot_h[4];
+
+    UINT64    last_completed;   // to tell a stalled GPU from a busy one
     UINT64    pending_out;
     ULONGLONG pending_since;
     int  consecutive_fails;
@@ -97,7 +103,6 @@ struct Bridge
     LONGLONG qpf;
     LONGLONG cpu_ticks;
     LONGLONG span_start;
-    LONGLONG last_entry;
     UINT64   timed_frames;
 
     // The game's depth is R24G8_TYPELESS and D3D11 will not create a shared

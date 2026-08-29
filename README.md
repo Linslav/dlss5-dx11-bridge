@@ -142,9 +142,11 @@ without a conversation:
 
 - the exact build, with its compile date
 - the host executable and Windows version
-- **which of the required files are actually present next to the add-on** —
-  the most common cause of "it does nothing" is a missing `renodx-dlss5.addon64`
-  or `nvngx_dlssnr.dll`
+- **which of NVIDIA's model files are present next to the add-on**, and every
+  `*.addon*` in the folder — the most common cause of "it does nothing" is a
+  missing `nvngx_dlssnr.dll` or no DLSS 5 add-on at all
+- **which `d3d11.dll` the process is using** — a wrapper in the game folder
+  (ENB, a proxy) rather than the one in System32
 - every other ReShade add-on in the folder, so conflicts are visible
 - the GPU and driver
 - the NGX capabilities this GPU will agree to. `SuperSamplingDenoising.Available`
@@ -157,24 +159,31 @@ without a conversation:
 - if they were hooked but nobody called them within 60 seconds, an explicit
   note saying so — that is a different problem from failing to hook, and the
   log distinguishes them
-- whether `sl.interposer.dll` is in the process, because DLSS driven through
-  Streamline never reaches the functions this add-on hooks
+- whether `sl.interposer.dll` is in the process. Streamline does reach this
+  add-on — it links NVIDIA's NGX D3D11 client and calls the same entry points on
+  the feature snippet — but the calls then come from Streamline rather than from
+  the game, which is worth knowing when reading the parameter block
 
 ## Confirmed working
 
-Reported by users, on five unrelated engines:
+Reported by users, across six unrelated engines:
 
-- **Baldur's Gate 3** (Divinity 4.0) — tested in depth here, native DLSS, DLAA
-  and every quality preset
-- **Fallout 4** (Creation) — DLSS supplied by a third-party injector rather
-  than by the game
-- **7 Days to Die** (Unity)
-- **The Legend of Heroes: Trails beyond the Horizon** (Falcom) — needed both
-  fixes in 1.0.4 and 1.0.5, and is the reason they exist
-- **S.T.A.L.K.E.R. Anomaly** (X-Ray)
+| Title | Engine | DLSS from |
+| --- | --- | --- |
+| **Baldur's Gate 3** | Divinity 4.0 | the game — tested in depth here, DLAA and every quality preset |
+| **Final Fantasy XIV Online** | in-house | the game |
+| **The Legend of Heroes: Trails beyond the Horizon** | Falcom | the game — needed both fixes in 1.0.4 and 1.0.5, and is the reason they exist |
+| **Tainted Grail: Fall of Avalon** | Unity | the game |
+| **7 Days to Die** | Unity | the game |
+| **Skyrim Special Edition** | Creation | a DLSS injector mod |
+| **Fallout 4** | Creation | a DLSS injector mod |
+| **S.T.A.L.K.E.R. Anomaly** | X-Ray | an upscaler injector mod (SSS24) |
 
-Fallout 4 matters for a second reason: it shows the bridge picks up DLSS that
-another mod provides, not only DLSS built into the game.
+The last three matter for a second reason: they show the bridge picks up DLSS
+that another mod provides, not only DLSS built into the game. Those setups reach
+NGX by a different route — the mod links NGX statically and calls the feature
+snippet directly, rather than through the driver's loader — which is why every
+module exporting the API is hooked rather than one chosen by guesswork.
 
 Nothing here targets a particular game. Every module exporting the NGX D3D11
 API is hooked, and every size, format and offset is read from the parameter
