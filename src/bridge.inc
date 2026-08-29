@@ -17,6 +17,12 @@ static NVSDK_NGX_Result SafeEvaluateGuarded(PFN_D3D12EvaluateFeature fn,
 // experiments.
 //
 //   mode=2         0 never writes to the game, 1 transport only, 2 full path
+//   skip_exe=1     hold off on the host executable's own NGX entry points, and
+//                  hook them only if nothing has called DLSS a minute later. A
+//                  game that links the NGX client statically -- The Elder
+//                  Scrolls Online does -- would otherwise have its code section
+//                  patched at startup, which is what an integrity check
+//                  terminates a process for. 0 hooks them at once, 2 never
 //   dred=1         ask D3D12 to record what the GPU was executing, so a reset
 //                  can be explained. Read once, when the session opens, so a
 //                  change takes effect on the next launch
@@ -87,9 +93,10 @@ struct BridgeCfg
     int stage;
     int skip_game;
     int dred;
+    int skip_exe;
 };
 
-static BridgeCfg g_cfg = { 2, -1, 1, 0, 0, 3, 1, 1 };
+static BridgeCfg g_cfg = { 2, -1, 1, 0, 0, 3, 1, 1, 1 };
 
 // Accumulates the two figures and reports them together, because either one
 // alone is misleading.
@@ -203,6 +210,7 @@ static void CfgReload()
         if      (_stricmp(key, "mode")        == 0) next.mode        = val;
         else if (_stricmp(key, "flags")       == 0) next.flags       = val;
         else if (_stricmp(key, "dred")        == 0) next.dred        = val;
+        else if (_stricmp(key, "skip_exe")    == 0) next.skip_exe    = val;
         else if (_stricmp(key, "subrects")    == 0) next.subrects    = val;
         else if (_stricmp(key, "reset_every") == 0) next.reset_every = val;
         else if (_stricmp(key, "pixels")      == 0) next.pixels      = val;
@@ -222,9 +230,9 @@ static void CfgReload()
 
     g_cfg = next;
     Log("[bridge] config: stage=%d mode=%d flags=%d subrects=%d reset_every=%d pixels=%d "
-        "skip_game=%d dred=%d",
+        "skip_game=%d dred=%d skip_exe=%d",
         g_cfg.stage, g_cfg.mode, g_cfg.flags, g_cfg.subrects, g_cfg.reset_every, g_cfg.pixels,
-        g_cfg.skip_game, g_cfg.dred);
+        g_cfg.skip_game, g_cfg.dred, g_cfg.skip_exe);
 
     // Creation-time values only take effect on a new feature, so invalidate the
     // current one and let the next frame build it again.
@@ -239,9 +247,9 @@ static void CfgWriteDefault()
 
     FILE *f = nullptr;
     if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
-    fprintf(f, "stage=%d\nmode=%d\nskip_game=%d\nflags=%d\nsubrects=%d\nreset_every=%d\npixels=%d\ndred=%d\n",
+    fprintf(f, "stage=%d\nmode=%d\nskip_game=%d\nflags=%d\nsubrects=%d\nreset_every=%d\npixels=%d\ndred=%d\nskip_exe=%d\n",
             g_cfg.stage, g_cfg.mode, g_cfg.skip_game, g_cfg.flags, g_cfg.subrects,
-            g_cfg.reset_every, g_cfg.pixels, g_cfg.dred);
+            g_cfg.reset_every, g_cfg.pixels, g_cfg.dred, g_cfg.skip_exe);
     fclose(f);
     Log("[bridge] wrote default config to %s", path);
 }
@@ -290,6 +298,22 @@ static void BridgeReleaseTextures();
 // nothing else, which left the DLSS feature, four shared textures and their NT
 // handles resident for the rest of the session -- while telling the user the
 // game was rendering normally.
+// How much of the card is spoken for. Escape from Tarkov runs 128-bit-per-pixel
+// buffers, which makes every mirror here four times the size of Baldur's Gate
+// 3's, and running past the budget is one of the few things that produces a
+// reset without a page fault.
+static void LogVideoMemory(const char *when)
+{
+    if (g_bridge.adapter3 == nullptr) return;
+    DXGI_QUERY_VIDEO_MEMORY_INFO vm = {};
+    if (FAILED(g_bridge.adapter3->QueryVideoMemoryInfo(
+            0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vm)))
+        return;
+    Log("[bridge] video memory %s: %llu MB used of %llu MB budget%s", when,
+        vm.CurrentUsage / (1024 * 1024), vm.Budget / (1024 * 1024),
+        vm.CurrentUsage > vm.Budget ? "  -- over budget" : "");
+}
+
 // Device Removed Extended Data. When Windows resets a hung GPU, the only
 // account of what it was doing lives in the driver, and DRED is how it is asked
 // for: a per-command-list record of how many operations completed, and the
@@ -358,6 +382,8 @@ static void BridgeDisable(const char *why)
         g_bridge.pending_out = 0;
     }
     BridgeReleaseTextures();
+    if (g_bridge.adapter3 != nullptr)
+    { g_bridge.adapter3->Release(); g_bridge.adapter3 = nullptr; }
 }
 
 // The reason reaches the user unchanged. It used to be replaced with "the NGX
@@ -727,16 +753,33 @@ static bool BridgeInitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
     {
         DXGI_ADAPTER_DESC ad = {};
         adapter->GetDesc(&ad);
-        Log("[bridge] adapter: %ls  vram=%llu MB", ad.Description,
-            static_cast<unsigned long long>(ad.DedicatedVideoMemory / (1024 * 1024)));
+        // The adapter, its ids and the driver are recorded at the first DLSS
+        // call, which every game reaches before this point. Repeating them here
+        // is four lines of nothing.
 
-        LARGE_INTEGER umd = {};
-        if (SUCCEEDED(adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &umd)))
-            Log("[bridge] driver: %u.%u.%u.%u",
-                static_cast<unsigned>((umd.HighPart >> 16) & 0xFFFF),
-                static_cast<unsigned>(umd.HighPart & 0xFFFF),
-                static_cast<unsigned>((umd.LowPart >> 16) & 0xFFFF),
-                static_cast<unsigned>(umd.LowPart & 0xFFFF));
+        // Windows resets a GPU that has not answered within TdrDelay seconds.
+        // The default is 2, but it is a registry value and people change it, so
+        // a stall figure in this log cannot be read against a guess.
+        {
+            DWORD delay = 0, ddi = 0, cb = sizeof(DWORD);
+            const LSTATUS a1 = RegGetValueW(HKEY_LOCAL_MACHINE,
+                L"SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers",
+                L"TdrDelay", RRF_RT_REG_DWORD, nullptr, &delay, &cb);
+            cb = sizeof(DWORD);
+            const LSTATUS a2 = RegGetValueW(HKEY_LOCAL_MACHINE,
+                L"SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers",
+                L"TdrDdiDelay", RRF_RT_REG_DWORD, nullptr, &ddi, &cb);
+            Log("[bridge] GPU reset timeout: TdrDelay %s, TdrDdiDelay %s",
+                a1 == ERROR_SUCCESS ? "set" : "default 2 s",
+                a2 == ERROR_SUCCESS ? "set" : "default 5 s");
+            if (a1 == ERROR_SUCCESS) Log("[bridge]   TdrDelay = %lu s", delay);
+            if (a2 == ERROR_SUCCESS) Log("[bridge]   TdrDdiDelay = %lu s", ddi);
+        }
+
+        adapter->QueryInterface(__uuidof(IDXGIAdapter3),
+                                reinterpret_cast<void **>(&g_bridge.adapter3));
+        LogVideoMemory("at session open");
+
     }
 
     HMODULE d3d12 = LoadLibraryW(L"d3d12.dll");
@@ -953,6 +996,26 @@ static void LogD3D12Desc(int i)
         (rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) ? " SIMULTANEOUS" : "");
     if (i == SLOT_OUTPUT && !(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
         Log("[bridge]   *** Output has no UAV flag on the D3D12 side: DLSS cannot write it ***");
+
+    if (g_bridge.dev12 != nullptr)
+    {
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT fs = {};
+        fs.Format = rd.Format;
+        if (SUCCEEDED(g_bridge.dev12->CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs))))
+        {
+            const bool sample = (fs.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE) != 0;
+            const bool uav    = (fs.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) != 0;
+            const bool load   = (fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD) != 0;
+            const bool store  = (fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) != 0;
+            Log("[bridge]   fmt %u support: sample %s, typed UAV %s, UAV load %s, UAV store %s",
+                rd.Format, sample ? "yes" : "NO", uav ? "yes" : "NO",
+                load ? "yes" : "NO", store ? "yes" : "NO");
+            if (i == SLOT_OUTPUT && !store)
+                Log("[bridge]   *** the driver does not support typed UAV stores in this "
+                    "format, and DLSS writes its result through one ***");
+        }
+    }
 }
 
 // One texture visible to both APIs. Two ways exist to get one and neither is
@@ -993,6 +1056,11 @@ static bool MakeSharedPair(ID3D11Device *dev11, ID3D11Device1 *dev1, int i,
                                        reinterpret_cast<void **>(&g_bridge.tex11[i]));
     if (SUCCEEDED(hr))
     {
+    {
+        wchar_t n[64];
+        _snwprintf_s(n, _TRUNCATE, L"dlss5-dx11-bridge %hs", kSlotName[i]);
+        g_bridge.tex12[i]->SetName(n);
+    }
         Log("[bridge] %-6s %ux%u fmt=%u  via D3D12->D3D11  d3d12=%p d3d11=%p",
             kSlotName[i], w, h, fmt, static_cast<void *>(g_bridge.tex12[i]),
             static_cast<void *>(g_bridge.tex11[i]));
@@ -1045,6 +1113,11 @@ static bool MakeSharedPair(ID3D11Device *dev11, ID3D11Device1 *dev1, int i,
         return false;
     }
 
+    {
+        wchar_t n[64];
+        _snwprintf_s(n, _TRUNCATE, L"dlss5-dx11-bridge %hs", kSlotName[i]);
+        g_bridge.tex12[i]->SetName(n);
+    }
     Log("[bridge] %-6s %ux%u fmt=%u  via D3D11->D3D12  d3d12=%p d3d11=%p",
         kSlotName[i], w, h, fmt, static_cast<void *>(g_bridge.tex12[i]),
         static_cast<void *>(g_bridge.tex11[i]));
@@ -1475,6 +1548,12 @@ static void LogDred()
                         k == done ? "   <== stopped here" : "");
             }
         }
+        if (bc.pHeadAutoBreadcrumbNode != nullptr)
+            Log("  This add-on records four barriers, hands the list to NGX between "
+                "a BeginEvent and an EndEvent, then records four more. An operation "
+                "that is neither among the first five nor the last five belongs to "
+                "NGX rather than to this add-on.");
+
         if (bc.pHeadAutoBreadcrumbNode == nullptr)
             Log("  no breadcrumbs were recorded, so the reset did not happen inside "
                 "a command list this add-on submitted.");
@@ -1503,6 +1582,8 @@ static bool BridgeDeviceLost()
 {
     if (g_bridge.fence12 == nullptr) return false;
     if (g_bridge.fence12->GetCompletedValue() != UINT64_MAX) return false;
+
+    LogVideoMemory("at the moment the device was lost");
 
     const HRESULT why = g_bridge.dev12 != nullptr
                       ? g_bridge.dev12->GetDeviceRemovedReason() : 0;

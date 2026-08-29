@@ -64,6 +64,7 @@ struct Bridge
     int  consecutive_fails;
 
     ID3D12Device              *dev12;
+    IDXGIAdapter3             *adapter3;
     ID3D12CommandQueue        *queue;
     ID3D12GraphicsCommandList *list;
 

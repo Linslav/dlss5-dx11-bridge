@@ -39,7 +39,7 @@
 #pragma comment(lib, "version.lib")
 
 // Kept in step with version.rc, which is where ReShade's overlay reads it from.
-#define BRIDGE_VERSION "1.0.16"
+#define BRIDGE_VERSION "1.0.17"
 
 extern "C" __declspec(dllexport) const char *NAME =
     "DLSS 5 DX11 Bridge " BRIDGE_VERSION;
@@ -300,6 +300,12 @@ static volatile LONG    g_layer_count;
 // lock, dozens of them during a startup, in a process the loader lock is
 // serialising. Escape from Tarkov and The Elder Scrolls Online both showed the
 // same line forty times before anything else happened.
+// Set when the host executable's own NGX exports were left alone, so the idle
+// diagnosis can name it rather than leaving the reader to guess.
+static bool             g_skipped_host_exe;
+static HMODULE          g_deferred_exe;
+static bool             g_force_exe;
+
 static HMODULE          g_rejected[64];
 static volatile LONG    g_rejected_count;
 
@@ -308,6 +314,19 @@ static bool AlreadyRejected(HMODULE m)
     for (LONG i = 0; i < g_rejected_count; ++i)
         if (g_rejected[i] == m) return true;
     return false;
+}
+
+// The host executable is skipped first and hooked only if nothing else carries
+// the calls. Undoing one rejection is what makes that reversible.
+static void ForgetRejected(HMODULE m)
+{
+    for (LONG i = 0; i < g_rejected_count; ++i)
+        if (g_rejected[i] == m)
+        {
+            g_rejected[i] = g_rejected[g_rejected_count - 1];
+            g_rejected_count = g_rejected_count - 1;
+            return;
+        }
 }
 
 static void RememberRejected(HMODULE m)
@@ -504,6 +523,42 @@ static void DumpFloat(const NVSDK_NGX_Parameter *p, const char *key)
         Log("    %-40s = %.6f", key, static_cast<double>(v));
 }
 
+// The adapter and driver were only recorded when the D3D12 session opened, so a
+// game that dies before that -- The Elder Scrolls Online does -- left a report
+// with no machine in it at all. The game's own D3D11 device knows the adapter,
+// and by the first DLSS call it certainly exists.
+static void LogAdapterOnce(ID3D11Device *dev)
+{
+    static bool done = false;
+    if (done || dev == nullptr) return;
+    done = true;
+
+    IDXGIDevice  *dxgi = nullptr;
+    IDXGIAdapter *ad   = nullptr;
+    if (FAILED(dev->QueryInterface(__uuidof(IDXGIDevice),
+                                   reinterpret_cast<void **>(&dxgi))) || dxgi == nullptr)
+        return;
+    dxgi->GetAdapter(&ad);
+    dxgi->Release();
+    if (ad == nullptr) return;
+
+    DXGI_ADAPTER_DESC d = {};
+    ad->GetDesc(&d);
+    Log("  adapter: %ls  vram=%llu MB  vendor 0x%04X device 0x%04X subsys 0x%08X rev %u",
+        d.Description,
+        static_cast<unsigned long long>(d.DedicatedVideoMemory / (1024 * 1024)),
+        d.VendorId, d.DeviceId, d.SubSysId, d.Revision);
+
+    LARGE_INTEGER umd = {};
+    if (SUCCEEDED(ad->CheckInterfaceSupport(__uuidof(IDXGIDevice), &umd)))
+        Log("  driver: %u.%u.%u.%u",
+            static_cast<unsigned>((umd.HighPart >> 16) & 0xFFFF),
+            static_cast<unsigned>(umd.HighPart & 0xFFFF),
+            static_cast<unsigned>((umd.LowPart >> 16) & 0xFFFF),
+            static_cast<unsigned>(umd.LowPart & 0xFFFF));
+    ad->Release();
+}
+
 static void DumpContext(ID3D11DeviceContext *ctx)
 {
     if (ctx == nullptr) { Log("    context                 = null"); return; }
@@ -539,8 +594,9 @@ static void DumpContext(ID3D11DeviceContext *ctx)
 static void DumpEvaluate(ID3D11DeviceContext *ctx, const NVSDK_NGX_Handle *handle,
                          const NVSDK_NGX_Parameter *p, long n)
 {
-    Log("--- EvaluateFeature #%ld  handle=%p params=%p ---", n,
-        static_cast<const void *>(handle), static_cast<const void *>(p));
+    Log("--- EvaluateFeature #%ld  handle=%p params=%p  thread %lu ---", n,
+        static_cast<const void *>(handle), static_cast<const void *>(p),
+        GetCurrentThreadId());
 
     DumpContext(ctx);
     if (p == nullptr) { Log("    params is null"); return; }
@@ -731,6 +787,41 @@ static void DumpCapability(NVSDK_NGX_Parameter *caps)
 // Defined with the idle report it withdraws.
 static void RetractIdleNote();
 static void TryInstallHooks();
+
+// Two builds of one NGX snippet in a single process is a configuration nobody
+// would notice by reading version lines one at a time. Escape from Tarkov runs
+// the game's own nvngx_dlss.dll at 310.7.129.0 and a hand-placed one at
+// 310.8.0.0, and it is the only reported title whose GPU is reset. That is not
+// a diagnosis, but 1.0.5 already fixed one fault caused by a hand-placed
+// snippet of a different build from the driver's, so the shape is worth naming
+// rather than leaving in two lines four hundred apart.
+struct SeenSnippet { wchar_t leaf[64]; char ver[48]; };
+static SeenSnippet   g_seen[24];
+static volatile LONG g_seen_count;
+
+static void NoteSnippetVersion(const wchar_t *leaf, const char *ver)
+{
+    for (LONG i = 0; i < g_seen_count; ++i)
+    {
+        if (_wcsicmp(g_seen[i].leaf, leaf) != 0) continue;
+        if (strcmp(g_seen[i].ver, ver) == 0) return;
+
+        Log("  *** %ls is loaded twice at different versions: %s and %s. One of "
+            "them was placed by hand. NGX loads one of the two for this add-on's "
+            "D3D12 session while the game uses the other, and a snippet that does "
+            "not match the driver has faulted before. Removing the hand-placed "
+            "copy leaves the game's own in use. ***",
+            leaf, g_seen[i].ver, ver);
+        return;
+    }
+    if (g_seen_count < static_cast<LONG>(_countof(g_seen)))
+    {
+        const LONG k = g_seen_count;
+        wcscpy_s(g_seen[k].leaf, leaf);
+        strcpy_s(g_seen[k].ver, ver);
+        g_seen_count = k + 1;
+    }
+}
 
 // Reads a file's VERSIONINFO. Every component in this stack is versioned and
 // distributed separately -- the driver's NGX loader, the feature snippets, the
@@ -1010,7 +1101,13 @@ static NVSDK_NGX_Result ForwardCreate(Hook &h, ID3D11DeviceContext *ctx, int fea
     Breadcrumb("forwarding the game's DLSS create");
     const LONG n = InterlockedIncrement(&g_create_count);
     if (n == 1) RetractIdleNote();
-    Log("=== CreateFeature #%ld  feature_id=%d ===", n, feature_id);
+    Log("=== CreateFeature #%ld  feature_id=%d  thread %lu ===", n, feature_id,
+        GetCurrentThreadId());
+    {
+        ID3D11Device *d = nullptr;
+        if (ctx != nullptr) ctx->GetDevice(&d);
+        if (d != nullptr) { LogAdapterOnce(d); d->Release(); }
+    }
     DumpContext(ctx);
     if (p != nullptr)
     {
@@ -1207,7 +1304,10 @@ static int HookNewNgxModules()
         {
             char ver[64];
             if (FileVersionString(path, ver, sizeof(ver)))
+            {
                 Log("  version %s", ver);
+                NoteSnippetVersion(leaf, ver);
+            }
         }
         Log("  NVSDK_NGX_D3D11_CreateFeature     = %p", create);
         Log("  NVSDK_NGX_D3D11_EvaluateFeature   = %p", eval);
@@ -1279,8 +1379,13 @@ static void LogEnvironment()
             OSVERSIONINFOEXW vi = {};
             vi.dwOSVersionInfoSize = sizeof(vi);
             if (rtl(&vi) == 0)
-                Log("  windows: %lu.%lu build %lu", vi.dwMajorVersion, vi.dwMinorVersion,
-                    vi.dwBuildNumber);
+                // Windows 11 still reports major version 10; only the build
+                // separates them. Reports have to be comparable at a glance, and
+                // "10.0 build 19044" is not obviously a different operating
+                // system from "10.0 build 26200".
+                Log("  windows: %s, %lu.%lu build %lu",
+                    vi.dwBuildNumber >= 22000 ? "Windows 11" : "Windows 10",
+                    vi.dwMajorVersion, vi.dwMinorVersion, vi.dwBuildNumber);
         }
     }
 }
@@ -1370,6 +1475,37 @@ static void LogNgxCandidates()
                                  (wcsstr(leaf, L"nvngx") != nullptr);
 
         if (!d3d11 && !d3d12 && !vk && !interesting) continue;
+
+        // The Elder Scrolls Online exports the NGX entry points from eso64.exe
+        // itself: it links the NGX client statically rather than loading it.
+        // Hooking those means writing fourteen bytes into the game's own code
+        // section, and ESO is the only reported title that dies with no
+        // exception, no shutdown marker and a log that simply stops -- which is
+        // what a process terminated by an integrity check looks like.
+        //
+        // Skipping costs little. A statically linked NGX client still reaches
+        // the driver's _nvngx.dll and the feature snippet, and both are hooked
+        // as their own layers; ESO's log shows all three present. If a game ever
+        // exposes NGX nowhere else, the idle diagnosis below says so and the
+        // result is an add-on that does nothing rather than a dead game.
+        if (mods[i] == GetModuleHandleW(nullptr) && !g_force_exe)
+        {
+            if (g_cfg.skip_exe != 0)
+            {
+                Log("  holding off on %ls: it is the host executable rather than a "
+                    "library, so its NGX entry points sit in the game's own code "
+                    "section. The driver's loader and the feature snippet are "
+                    "hooked as their own layers and should carry the same calls. "
+                    "If nothing calls DLSS within a minute, this one is hooked "
+                    "after all rather than leaving the add-on doing nothing.", leaf);
+                g_skipped_host_exe = true;
+                if (g_cfg.skip_exe == 1) g_deferred_exe = mods[i];
+                RememberRejected(mods[i]);
+                continue;
+            }
+            Log("  %ls is the host executable, and skip_exe=0, so its own code "
+                "section is being patched.", leaf);
+        }
 
         Log("    %ls  ->%s%s%s%s", path, d3d11 ? " D3D11" : "", d3d12 ? " D3D12" : "",
             vk ? " VULKAN" : "",
@@ -1526,6 +1662,23 @@ static void ReportIdle()
 
     Log("");
     Log("60 seconds after hooking, nothing has called DLSS through these entry points.");
+
+    // The host executable was held back because patching a game's own code
+    // section is what an integrity check terminates a process for. A minute of
+    // silence says the other layers are not carrying the calls, and an add-on
+    // that does nothing is no better than one that takes the risk. Hook it.
+    if (g_deferred_exe != nullptr)
+    {
+        Log("  The host executable's own NGX entry points were held back. Nothing "
+            "has called DLSS through the driver's loader either, so they are being "
+            "hooked now. skip_exe=0 hooks them from the start; skip_exe=2 never "
+            "does, for a game that dies when they are patched.");
+        g_force_exe = true;
+        ForgetRejected(g_deferred_exe);
+        g_deferred_exe = nullptr;
+        TryInstallHooks();
+        if (g_create_count > 0 || g_eval_count > 0) return;
+    }
     SayWhyNothingCalled();
 }
 
