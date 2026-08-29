@@ -316,6 +316,28 @@ static void EnableDred(HMODULE d3d12)
         "recorded here.");
 }
 
+// The breadcrumb history is a list of these, and a bare number in a report
+// costs whoever reads it a trip to d3d12.h. Names taken from the enum itself.
+static const char *BreadcrumbOpName(unsigned op)
+{
+    static const char *k[] = {
+        "SetMarker", "BeginEvent", "EndEvent", "DrawInstanced",
+        "DrawIndexedInstanced", "ExecuteIndirect", "Dispatch", "CopyBufferRegion",
+        "CopyTextureRegion", "CopyResource", "CopyTiles", "ResolveSubresource",
+        "ClearRenderTargetView", "ClearUnorderedAccessView", "ClearDepthStencilView",
+        "ResourceBarrier", "ExecuteBundle", "Present", "ResolveQueryData",
+        "BeginSubmission", "EndSubmission", "DecodeFrame", "ProcessFrames",
+        "AtomicCopyBufferUint", "AtomicCopyBufferUint64", "ResolveSubresourceRegion",
+        "WriteBufferImmediate", "DecodeFrame1", "SetProtectedResourceSession",
+        "DecodeFrame2", "ProcessFrames1", "BuildRaytracingAccelerationStructure",
+        "EmitRaytracingAccelerationStructurePostbuildInfo",
+        "CopyRaytracingAccelerationStructure", "DispatchRays",
+        "InitializeMetaCommand", "ExecuteMetaCommand", "EstimateMotion",
+        "ResolveMotionVectorHeap", "SetPipelineState1",
+    };
+    return op < _countof(k) ? k[op] : "unknown";
+}
+
 // Reads back what DRED collected. Only meaningful after the device is gone.
 static void BridgeDisable(const char *why)
 {
@@ -1193,7 +1215,23 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt,
     g_bridge.params->Set("Height", g_bridge.render_h);
     g_bridge.params->Set("OutWidth", g_bridge.ngx_out_w);
     g_bridge.params->Set("OutHeight", g_bridge.ngx_out_h);
-    g_bridge.params->Set("PerfQualityValue", 2);
+    // The quality preset is the game's statement of which DLSS model it asked
+    // for, and it was hardcoded to 2. That is Baldur's Gate 3's own answer
+    // again -- the same mistake as the create flags, in the line above them.
+    // Assetto Corsa and Gallipoli both ask for 1 and were given 2.
+    if (gp != nullptr) CopyUIntParam(gp, "PerfQualityValue", 2u);
+    else               g_bridge.params->Set("PerfQualityValue", 2);
+    {
+        unsigned int q = 0, asked_q = 0;
+        g_bridge.params->Get("PerfQualityValue", &q);
+        static const char *kQ[] = { "MaxPerf", "Balanced", "MaxQuality",
+                                    "UltraPerformance", "UltraQuality", "DLAA" };
+        const bool have_q =
+            gp != nullptr && gp->Get("PerfQualityValue", &asked_q) == NGX_SUCCESS;
+        Log("[bridge] quality preset %u (%s), %s", q,
+            q < _countof(kQ) ? kQ[q] : "unknown",
+            have_q ? "copied from the game" : "the game set none, so 2 is used");
+    }
 
     // The create flags describe the game's own buffers: whether the colour is
     // HDR, whether the depth is reversed, whether the motion vectors are at
@@ -1202,7 +1240,17 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt,
     // nowhere else: Assetto Corsa asks for 2, and was being told its SDR colour
     // is HDR and its normal depth is inverted. Copy it, and let the config
     // force a value only when it is set to something other than -1.
-    if (g_cfg.flags < 0 && gp != nullptr)
+    // 107 was this add-on's own default until 1.0.15, so a configuration file
+    // carrying it is repeating that default rather than stating a choice --
+    // and it keeps every existing installation on the old behaviour, where the
+    // correction reaches only whoever reads the log. Trails beyond the Horizon
+    // showed the cost: the game asks for 75, 107 adds DoSharpening, and the
+    // game had set Sharpness to 1.0 without ever enabling it. The old default
+    // is treated as unset, and the substitution is announced.
+    const bool old_default = (g_cfg.flags == 107);
+    const bool copying     = (g_cfg.flags < 0 || old_default) && gp != nullptr;
+
+    if (copying)
         CopyUIntParam(gp, "DLSS.Feature.Create.Flags", 107u);
     else
         g_bridge.params->Set("DLSS.Feature.Create.Flags",
@@ -1215,16 +1263,32 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt,
             gp != nullptr && gp->Get("DLSS.Feature.Create.Flags", &asked) == NGX_SUCCESS;
 
         if (have_asked) LogCreateFlags("the game's create", asked);
-        LogCreateFlags(g_cfg.flags < 0 ? "sent to D3D12, copied from the game"
-                                       : "sent to D3D12, forced by config", used);
+        LogCreateFlags(copying ? "sent to D3D12, copied from the game"
+                               : "sent to D3D12, forced by config", used);
 
-        // A config written by an older version carries flags=107, which was the
-        // default before it was understood to be Baldur's Gate 3's own answer
-        // rather than a universal one. Such a file keeps forcing it, so say what
-        // the game actually asked for and how to stop overriding it.
-        if (g_cfg.flags >= 0 && have_asked && asked != used)
+        if (old_default && copying)
+            Log("[bridge]   dlss5-dx11-bridge.cfg says flags=107, which was this "
+                "add-on's default before 1.0.16 rather than a description of this "
+                "game. It is being ignored in favour of the game's own value. To "
+                "force it, use flags=108 -- any value that is not 107 or -1 is "
+                "taken as deliberate.");
+
+        if (!copying && have_asked && asked != used)
             Log("[bridge]   these differ. Set flags=-1 in dlss5-dx11-bridge.cfg to "
                 "copy the game's own value; the file is re-read while playing.");
+
+        // DLSS applies its sharpening pass only when DoSharpening is set, and
+        // reads its strength from Sharpness whether or not the game meant it to
+        // be used. Adding the flag over a game that set one and not the other
+        // turns on a pass it deliberately left off.
+        if ((used & 0x20) != 0 && have_asked && (asked & 0x20) == 0)
+        {
+            float sharp = 0.0f;
+            gp->Get("Sharpness", &sharp);
+            Log("[bridge]   DoSharpening is set here but not by the game, and "
+                "Sharpness is %.2f. DLSS will sharpen at that strength; the game's "
+                "own DLSS would not have.", sharp);
+        }
 
         // IsHDR is the flag the DLSS 5 add-on reads to choose between its HDR and
         // its SDR codec, so asserting it over an 8-bit buffer sends it down the
@@ -1397,8 +1461,19 @@ static void LogDred()
             // The operation at the completed count is the one still running when
             // the GPU stopped, which is the whole point of asking.
             if (node->pCommandHistory != nullptr && done < node->BreadcrumbCount)
-                Log("    stopped inside operation %u, D3D12_AUTO_BREADCRUMB_OP %u.",
-                    done, static_cast<unsigned>(node->pCommandHistory[done]));
+            {
+                Log("    stopped inside operation %u, a %s.", done,
+                    BreadcrumbOpName(static_cast<unsigned>(node->pCommandHistory[done])));
+
+                const UINT from = done > 12 ? done - 12 : 0;
+                const UINT to   = done + 4 < node->BreadcrumbCount
+                                ? done + 4 : node->BreadcrumbCount;
+                Log("    operations %u to %u:", from, to - 1);
+                for (UINT k = from; k < to; ++k)
+                    Log("      %3u %s%s", k,
+                        BreadcrumbOpName(static_cast<unsigned>(node->pCommandHistory[k])),
+                        k == done ? "   <== stopped here" : "");
+            }
         }
         if (bc.pHeadAutoBreadcrumbNode == nullptr)
             Log("  no breadcrumbs were recorded, so the reset did not happen inside "
@@ -1539,6 +1614,20 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
     BridgeRescueStalledQueue();
     if (g_bridge.disabled || !g_bridge.session_ready || gp == nullptr) return;
 
+    if (g_bridge.paused_until != 0)
+    {
+        if (GetTickCount64() < g_bridge.paused_until) return;
+        g_bridge.paused_until  = 0;
+        g_bridge.rebuilds      = 0;
+        g_bridge.rebuild_since = GetTickCount64();
+        if (!g_bridge.resume_reported)
+        {
+            g_bridge.resume_reported = true;
+            Log("[bridge] resuming: trying the render shape again. Further pauses and "
+                "resumes are not reported; the frame counter shows them.");
+        }
+    }
+
     // Signal and Wait are immediate-context operations. On a deferred context
     // they are illegal, the fence is never signalled, and the D3D11 queue then
     // waits forever on it -- which a game's render thread watchdog reports as a
@@ -1666,6 +1755,34 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
 
     if (!g_bridge.frame_ready || shape_changed)
     {
+        // A game changing resolution rebuilds once. A game alternating between
+        // two buffers rebuilds forever, and each rebuild costs four shared
+        // texture pairs and an NGX feature. Past a rebuild every few frames the
+        // honest reading is that there is no single shape to serve, so the
+        // bridge stands aside and lets the game render itself until one settles.
+        const ULONGLONG now = GetTickCount64();
+        if (now - g_bridge.rebuild_since > 2000)
+        { g_bridge.rebuild_since = now; g_bridge.rebuilds = 0; }
+
+        if (++g_bridge.rebuilds > 8)
+        {
+            if (!g_bridge.pause_reported)
+            {
+                Log("[bridge] the render shape has changed %d times in two seconds, so "
+                    "there is no one shape to mirror. Standing aside until it settles; "
+                    "the game renders on its own meanwhile.", g_bridge.rebuilds);
+                for (int i = 0; i < SLOT_COUNT; ++i)
+                    Log("[bridge]   slot %d: %ux%u fmt=%u", i, d[i].Width, d[i].Height,
+                        static_cast<unsigned>(d[i].Format));
+                g_bridge.pause_reported = true;
+            }
+            g_bridge.paused_until = now + 3000;
+            g_bridge.frame_ready  = false;
+            for (int i = 0; i < SLOT_COUNT; ++i) g[i]->Release();
+            dev11->Release();
+            return;
+        }
+
         DXGI_FORMAT fmt[SLOT_COUNT];
         for (int i = 0; i < SLOT_COUNT; ++i) fmt[i] = d[i].Format;
         g_bridge.width      = d[SLOT_COLOR].Width;
@@ -1686,7 +1803,6 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
             dev11->Release();
             return;
         }
-        g_bridge.consecutive_fails = 0;
     }
 
     // If the game alternates its Color and Output textures, writing the result
@@ -1798,9 +1914,12 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
     DWORD code = 0;
     Breadcrumb("running the D3D12 evaluate");
     NVSDK_NGX_Result re = NGX_SUCCESS;
+    static const char kNgxMark[] = "ngx evaluate";
+    g_bridge.list->BeginEvent(1, kNgxMark, sizeof(kNgxMark));
     if (mode != 1)
         re = SafeEvaluateGuarded(g_bridge.eval_feature, g_bridge.list,
                                  g_bridge.feature, g_bridge.params, &code);
+    g_bridge.list->EndEvent();
 
     Barrier(g_bridge.list, g_bridge.tex12[SLOT_COLOR],
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
@@ -1828,6 +1947,9 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
     }
     else
     {
+        // Only a completed evaluate clears the failure count.
+        g_bridge.consecutive_fails = 0;
+
         // 4. take the result back into the game's own output texture.
         //
         // The wait stays on the GPU: moving it to the CPU costs about nine

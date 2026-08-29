@@ -36,6 +36,18 @@ struct Bridge
     // releases the game even when the work behind it never arrives.
     // Each slot's own dimensions, so a mirror is never sized from another
     // slot's texture.
+    // Rebuild thrash. Gallipoli's respawn screen alternates its Color texture
+    // between two buffers of different formats, one per frame, so every frame
+    // looked like a new shape and rebuilt four shared texture pairs and an NGX
+    // feature -- about forty milliseconds of work per frame, and a two-megabyte
+    // log. Counting rebuilds over a window is what tells a real resolution
+    // change apart from a game alternating between two of them.
+    ULONGLONG rebuild_since;
+    int       rebuilds;
+    ULONGLONG paused_until;
+    bool      pause_reported;
+    bool      resume_reported;
+
     UINT      slot_w[4];
     UINT      slot_h[4];
 
