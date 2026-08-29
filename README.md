@@ -25,9 +25,10 @@ receiving the calls it was always waiting for.
 Per frame:
 
 1. copy the game's Color and MotionVectors into shared textures
-2. convert the game's depth (`R24G8_TYPELESS`) into a shared `R32_FLOAT`
-   texture with a compute shader — `CopyResource` cannot, the two formats are
-   in different typeless families
+2. convert the game's depth into a shared `R32_FLOAT` texture with a compute
+   shader — `CopyResource` cannot, the formats are in different typeless
+   families. Which view format is legal depends on the game's depth format, so
+   it is read from the texture rather than assumed
 3. signal a fence shared between the D3D11 and D3D12 queues
 4. run the D3D12 evaluate, which is where the DLSS 5 add-on inserts itself
 5. signal back, and copy the result into the game's output
@@ -74,7 +75,7 @@ trigger a rebuild automatically.
 | `mode` | 2 | `0` never writes to the game, `1` transport only with no DLSS, `2` the full path. |
 | `skip_game` | 1 | Do not forward the game's own DLSS evaluate. Its result is overwritten anyway, so running it is wasted work. Suppressed only while the bridge is healthy and already delivering. |
 | `flags` | 107 | `DLSS.Feature.Create.Flags` for the bridge's feature. |
-| `subrects` | 1 | Value for `DLSS.Enable.Output.Subrects`. |
+| `subrects` | 1 | Fallback for `DLSS.Enable.Output.Subrects`, used only when the game does not set one of its own. |
 | `reset_every` | 0 | `1` forces the NGX Reset flag every frame, discarding temporal history. Diagnostic only. |
 | `pixels` | 0 | `1` reads pixels back to the CPU for debugging. Stalls the GPU hard. |
 
@@ -146,18 +147,22 @@ without a conversation:
   or `nvngx_dlssnr.dll`
 - every other ReShade add-on in the folder, so conflicts are visible
 - the GPU and driver
-- **the NGX capabilities this GPU will agree to**, including
-  `SuperSamplingDenoising.Available` — if that is `0` the feature is not
-  available on that hardware and nothing else in the log matters
-- whether the NGX entry points were found and hooked
-- if they were not, every loaded module exposing NGX or Streamline
+- the NGX capabilities this GPU will agree to. `SuperSamplingDenoising.Available`
+  is reported among them, but it describes Ray Reconstruction rather than
+  neural rendering, so a `0` there does not by itself mean the feature is
+  unavailable
+- **every module exporting the NGX D3D11 API, and which of them were hooked** —
+  one line per layer, with the entry-point addresses
+- if none were found, every loaded module exposing NGX or Streamline
 - if they were hooked but nobody called them within 60 seconds, an explicit
   note saying so — that is a different problem from failing to hook, and the
   log distinguishes them
+- whether `sl.interposer.dll` is in the process, because DLSS driven through
+  Streamline never reaches the functions this add-on hooks
 
 ## Confirmed working
 
-Reported by users, on four unrelated engines:
+Reported by users, on five unrelated engines:
 
 - **Baldur's Gate 3** (Divinity 4.0) — tested in depth here, native DLSS, DLAA
   and every quality preset
@@ -166,13 +171,14 @@ Reported by users, on four unrelated engines:
 - **7 Days to Die** (Unity)
 - **The Legend of Heroes: Trails beyond the Horizon** (Falcom) — needed both
   fixes in 1.0.4 and 1.0.5, and is the reason they exist
+- **S.T.A.L.K.E.R. Anomaly** (X-Ray)
 
 Fallout 4 matters for a second reason: it shows the bridge picks up DLSS that
 another mod provides, not only DLSS built into the game.
 
-Nothing here targets a particular game. The NGX entry points are located by
-export name in whatever module exports them, and every size, format and offset
-is read from the parameter block the caller passes. Where it has failed so far
+Nothing here targets a particular game. Every module exporting the NGX D3D11
+API is hooked, and every size, format and offset is read from the parameter
+block the caller passes. Where it has failed so far
 it has been because something was hardcoded from the one game it was written
 against — see 1.0.4 — so reports from new titles are useful even when they work.
 

@@ -28,6 +28,7 @@ struct Bridge
     bool disabled;          // set after a hard failure; never retried
     bool session_ready;     // device, queue, fences, NGX session
     bool frame_ready;       // shared textures and NGX feature match the game
+    bool msaa_reported;     // the MSAA notice is said once per spell of it
     int  consecutive_fails;
 
     ID3D12Device              *dev12;

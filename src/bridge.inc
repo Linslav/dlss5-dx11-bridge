@@ -282,6 +282,11 @@ static bool BridgeBlitDepth(ID3D11DeviceContext *ctx, ID3D11Device *dev11, ID3D1
         default:                                 view = sdesc.Format; break;  // already typed
         }
 
+        // The numbers go alongside the names: a format this build has no name
+        // for is exactly the one a report needs to identify.
+        Log("[bridge] game depth is %s (%u), reading it as %s (%u)",
+            FormatName(sdesc.Format), sdesc.Format, FormatName(view), view);
+
         D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
         sd.Format              = view;
         sd.ViewDimension       = D3D11_SRV_DIMENSION_TEXTURE2D;
@@ -472,27 +477,58 @@ static bool BridgeInitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
             GetProcAddress(ngx, "NVSDK_NGX_D3D12_Init_ProjectID"));
 
         Breadcrumb("initialising NGX on D3D12");
-        DWORD code   = 0;
-        bool  inited = false;
-        for (int ver = 0x13; ver <= 0x16 && !inited; ++ver)
+        DWORD code    = 0;
+        bool  inited  = false;
+        bool  faulted = false;
+
+        // "Refused" and "faulted" are not the same answer and must not be
+        // treated the same. A refusal is NGX declining a version constant, and
+        // trying the next one is the whole point of this loop. A fault means NGX
+        // died inside itself, and everything it owns is now in an unknown state
+        // -- calling back in is what turned a disabled add-on into a killed
+        // process on Final Fantasy VII Remake. Stop at the first one.
+        for (int ver = 0x13; ver <= 0x16 && !inited && !faulted; ++ver)
         {
             if (init_ext != nullptr)
             {
                 NVSDK_NGX_Result r = SafeInitExt(init_ext, 0x1000000ULL, data_path,
                                                  g_bridge.dev12, ver, &code);
-                Log("[bridge] Init_Ext(version=0x%02X) -> %s", ver,
-                    code != 0 ? "faulted" : (r == NGX_SUCCESS ? "ok" : "refused"));
-                if (code == 0 && r == NGX_SUCCESS) { inited = true; break; }
+                if (code != 0)
+                {
+                    Log("[bridge] Init_Ext(version=0x%02X) raised 0x%08X", ver, code);
+                    faulted = true;
+                }
+                else
+                {
+                    Log("[bridge] Init_Ext(version=0x%02X) -> %s", ver,
+                        r == NGX_SUCCESS ? "ok" : "refused");
+                    if (r == NGX_SUCCESS) inited = true;
+                }
             }
-            if (init_project != nullptr)
+            if (!inited && !faulted && init_project != nullptr)
             {
                 NVSDK_NGX_Result r = SafeInitProjectID(init_project,
                                                        "a0f57b54-1daf-4934-90ae-c4035c19df04",
                                                        data_path, g_bridge.dev12, ver, &code);
-                Log("[bridge] Init_ProjectID(version=0x%02X) -> %s", ver,
-                    code != 0 ? "faulted" : (r == NGX_SUCCESS ? "ok" : "refused"));
-                if (code == 0 && r == NGX_SUCCESS) { inited = true; break; }
+                if (code != 0)
+                {
+                    Log("[bridge] Init_ProjectID(version=0x%02X) raised 0x%08X", ver, code);
+                    faulted = true;
+                }
+                else
+                {
+                    Log("[bridge] Init_ProjectID(version=0x%02X) -> %s", ver,
+                        r == NGX_SUCCESS ? "ok" : "refused");
+                    if (r == NGX_SUCCESS) inited = true;
+                }
             }
+        }
+        if (faulted)
+        {
+            Log("[bridge] NGX raised an exception opening its D3D12 session, so the");
+            Log("  bridge stops here rather than calling into it again. The game keeps");
+            Log("  rendering on its own; nothing else in this add-on runs this session.");
+            goto fail;
         }
         if (!inited)
         { Log("[bridge] no NGX D3D12 init entry point was accepted by this driver"); goto fail; }
@@ -696,7 +732,10 @@ static bool MakeSharedPair(ID3D11Device *dev11, ID3D11Device1 *dev1, int i,
 // from the game's own parameter block. Nothing here is derived or assumed: in an
 // upscaling mode the Output texture is larger than the inputs, and the rendered
 // area is smaller than the texture that holds it.
-static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt)
+static void CopyUIntParam(const NVSDK_NGX_Parameter *src, const char *key, unsigned int fallback);
+
+static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt,
+                                 const NVSDK_NGX_Parameter *gp)
 {
     Breadcrumb("building shared textures");
     const UINT w = g_bridge.width, h = g_bridge.height;
@@ -715,7 +754,11 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt)
         // Depth crosses as R32_FLOAT, written by a compute pass, because its
         // native R24G8_TYPELESS cannot be shared. It therefore needs a UAV too.
         const bool        is_depth   = (i == SLOT_DEPTH);
-        const DXGI_FORMAT share_fmt  = is_depth ? DXGI_FORMAT_R32_FLOAT : fmt[i];
+        const DXGI_FORMAT share_fmt  = is_depth ? DXGI_FORMAT_R32_FLOAT
+                                                : TypedFormat(fmt[i]);
+        if (!is_depth && share_fmt != fmt[i])
+            Log("[bridge] %s is %s; the shared copy uses %s, because nothing can view "
+                "a typeless texture", kSlotKey[i], FormatName(fmt[i]), FormatName(share_fmt));
         // MV gets a UAV purely so it can be cleared for the isolation test.
         const bool        needs_uav  = is_depth || (i == SLOT_OUTPUT) || (i == SLOT_MV);
         const UINT        tw = (i == SLOT_OUTPUT) ? g_bridge.out_width  : w;
@@ -726,7 +769,7 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt)
             if (i == SLOT_MV)
             {
                 D3D11_UNORDERED_ACCESS_VIEW_DESC mu = {};
-                mu.Format        = fmt[i];
+                mu.Format        = share_fmt;
                 mu.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
                 if (FAILED(dev11->CreateUnorderedAccessView(g_bridge.tex11[i], &mu, &g_bridge.mv_uav)))
                     Log("[bridge] MV UAV unavailable; mv_zero will do nothing");
@@ -741,7 +784,12 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt)
             if (SUCCEEDED(hr) && BridgeMakeDepthShader(dev11))
             {
                 g_bridge.depth_converted = true;
-                Log("[bridge] depth will be converted R24_UNORM_X8_TYPELESS -> R32_FLOAT");
+                // The source format is not known here -- it is read from the
+                // game's texture at blit time, and that is where it is logged.
+                // This line used to name R24_UNORM_X8_TYPELESS unconditionally,
+                // which read as a wrong conversion on every game whose depth is
+                // not BG3's.
+                Log("[bridge] depth will be converted to R32_FLOAT for DLSS");
                 continue;
             }
             Log("[bridge] depth UAV/shader setup failed 0x%08X, falling back", hr);
@@ -793,7 +841,14 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt)
     g_bridge.params->Set("OutHeight", g_bridge.ngx_out_h);
     g_bridge.params->Set("PerfQualityValue", 2);
     g_bridge.params->Set("DLSS.Feature.Create.Flags", g_cfg.flags);
-    g_bridge.params->Set("DLSS.Enable.Output.Subrects", g_cfg.subrects);
+    // Mirror the game's own answer where it gave one. Deus Ex: Mankind Divided
+    // asks for 0 here while BG3 asks for 1, and forcing either on the other is
+    // inventing part of a contract that is meant to be copied.
+    if (gp != nullptr)
+        CopyUIntParam(gp, "DLSS.Enable.Output.Subrects",
+                      static_cast<unsigned int>(g_cfg.subrects));
+    else
+        g_bridge.params->Set("DLSS.Enable.Output.Subrects", g_cfg.subrects);
     g_bridge.params->Set("CreationNodeMask", 1u);
     g_bridge.params->Set("VisibilityNodeMask", 1u);
     g_bridge.params->Set("RTXValue", 0);
@@ -840,6 +895,31 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt)
     Log("[bridge] feature ready: render %ux%u -> output %ux%u  (textures in %ux%u out %ux%u) handle=%p",
         g_bridge.render_w, g_bridge.render_h, g_bridge.ngx_out_w, g_bridge.ngx_out_h,
         w, h, g_bridge.out_width, g_bridge.out_height, static_cast<void *>(g_bridge.feature));
+
+    // What a DLSS 5 add-on will ask of the textures the bridge hands it, asked
+    // here first. Escape from Tarkov failed on exactly this and said so only
+    // from the other add-on's side, as "output format 1 is not a supported typed
+    // codec format" -- by which point the bridge looked healthy and the fault
+    // looked like someone else's. These textures are the bridge's own, so a
+    // refusal here is a bug here.
+    for (int i = 0; i < SLOT_COUNT; ++i)
+    {
+        if (i != SLOT_OUTPUT && i != SLOT_COLOR) continue;
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT fs = {};
+        fs.Format = (i == SLOT_DEPTH) ? DXGI_FORMAT_R32_FLOAT : TypedFormat(fmt[i]);
+        if (FAILED(g_bridge.dev12->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT,
+                                                       &fs, sizeof(fs))))
+            continue;
+        const bool can_sample = (fs.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE) != 0;
+        const bool can_uav    = (fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD) != 0 &&
+                                (fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) != 0;
+        const bool needs_uav  = (i == SLOT_OUTPUT);
+        if (can_sample && (can_uav || !needs_uav)) continue;
+        Warn("the bridge's %s texture is %s, which this GPU cannot %s. A DLSS 5 "
+             "add-on needs that and will refuse the frame.",
+             kSlotKey[i], FormatName(fs.Format),
+             !can_sample ? "sample in a shader" : "write through a typed UAV");
+    }
     for (int i = 0; i < SLOT_COUNT; ++i) g_bridge.fmt[i] = fmt[i];
     g_bridge.need_reset  = true;
     g_bridge.frame_ready = true;
@@ -900,17 +980,20 @@ static void Barrier(ID3D12GraphicsCommandList *list, ID3D12Resource *res,
 
 // Copies one float or int parameter straight across from the game's block, so the
 // D3D12 evaluate sees the same jitter and exposure the game computed this frame.
+// A failed Get is not required to leave the destination alone, so the result is
+// checked rather than assumed. Silently forwarding a zeroed value is how a
+// parameter the game never set becomes a wrong one the bridge invented.
 static void CopyFloatParam(const NVSDK_NGX_Parameter *src, const char *key, float fallback)
 {
-    float v = fallback;
-    src->Get(key, &v);
+    float v = 0.0f;
+    if (src->Get(key, &v) != NGX_SUCCESS) v = fallback;
     g_bridge.params->Set(key, v);
 }
 
 static void CopyUIntParam(const NVSDK_NGX_Parameter *src, const char *key, unsigned int fallback)
 {
-    unsigned int v = fallback;
-    src->Get(key, &v);
+    unsigned int v = 0;
+    if (src->Get(key, &v) != NGX_SUCCESS) v = fallback;
     g_bridge.params->Set(key, v);
 }
 
@@ -950,6 +1033,38 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
         }
     }
 
+    // A multisampled texture cannot be copied into a single-sample one, and a
+    // TEXTURE2D view over it is illegal. Watch Dogs 2 at MSAA 2x hits both: the
+    // depth view fails on a format the table maps correctly, and the colour copy
+    // quietly does nothing, so DLSS would be handed whatever the textures held
+    // last. The game's own DLSS fails there too, before the bridge touches it.
+    //
+    // This waits rather than disabling for the session: turning MSAA off is the
+    // usual fix, and clearing frame_ready means the rebuild happens by itself
+    // when the sample count drops. A change of sample count alone does not move
+    // any size or format, so nothing else would have noticed it.
+    UINT samples = 1;
+    for (int i = 0; i < SLOT_COUNT; ++i)
+        if (d[i].SampleDesc.Count > samples) samples = d[i].SampleDesc.Count;
+    if (samples > 1)
+    {
+        if (!g_bridge.msaa_reported)
+        {
+            g_bridge.msaa_reported = true;
+            Warn("this game is rendering with %ux MSAA. The bridge cannot read "
+                 "multisampled buffers; turn MSAA off in the game's settings to "
+                 "use it. The game is unaffected.", samples);
+        }
+        g_bridge.frame_ready = false;
+        for (int i = 0; i < SLOT_COUNT; ++i) g[i]->Release();
+        return;
+    }
+    if (g_bridge.msaa_reported)
+    {
+        g_bridge.msaa_reported = false;
+        Log("[bridge] MSAA is off now; rebuilding.");
+    }
+
     ID3D11Device *dev11 = nullptr;
     ctx->GetDevice(&dev11);
 
@@ -986,7 +1101,7 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
         g_bridge.ngx_out_w  = gow;
         g_bridge.ngx_out_h  = goh;
         Log("[bridge] rebuilding: render %ux%u -> %ux%u", gw, gh, gow, goh);
-        if (!BridgeBuildResources(dev11, fmt))
+        if (!BridgeBuildResources(dev11, fmt, gp))
         {
             BridgeFail("resource build");
             for (int i = 0; i < SLOT_COUNT; ++i) g[i]->Release();

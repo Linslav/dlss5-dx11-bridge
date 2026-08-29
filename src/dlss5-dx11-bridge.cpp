@@ -38,7 +38,7 @@
 #include <cstdint>
 
 // Kept in step with version.rc, which is where ReShade's overlay reads it from.
-#define BRIDGE_VERSION "1.0.9"
+#define BRIDGE_VERSION "1.0.10"
 
 extern "C" __declspec(dllexport) const char *NAME =
     "DLSS 5 DX11 Bridge " BRIDGE_VERSION;
@@ -240,10 +240,41 @@ struct Hook
     bool  active;
 };
 
-static Hook             g_hk_eval;
-static Hook             g_hk_eval_c;
-static Hook             g_hk_create;
+// Several modules can export the NGX D3D11 API at the same time: a game or mod
+// that links NGX, the driver's loader beneath it, and the feature snippet
+// beneath that. Which one the caller actually enters is not knowable from the
+// outside -- Baldur's Gate 3 calls its own exports, Skyrim's upscaler links NGX
+// statically and calls straight into nvngx_dlss.dll, never touching the loader.
+// Earlier builds tried to pick the right layer by name and got it wrong twice.
+// Hook every layer instead and let the outermost call win; see g_nest below.
+//
+// Twelve because the same snippet can be mapped more than once: Baldur's Gate 3
+// alone reaches six, with nvngx_dlss.dll appearing at two different bases.
+static const int kMaxLayers = 12;
+
+struct Layer
+{
+    HMODULE mod;
+    Hook    eval;
+    Hook    eval_c;
+    Hook    create;
+};
+
+static Layer            g_layer[kMaxLayers];
+static volatile LONG    g_layer_count;
 static CRITICAL_SECTION g_hook_cs;
+
+// Depth of NGX calls this thread is currently inside. Only the outermost is the
+// caller's; anything nested is NGX talking to itself, with parameters it has
+// already rewritten for its own use. Reading those as if they were the game's
+// is what made 1.0.5 necessary.
+static __declspec(thread) int g_nest;
+
+struct NestGuard
+{
+    NestGuard()  { ++g_nest; }
+    ~NestGuard() { --g_nest; }
+};
 
 static bool WriteCode(void *dst, const void *src, size_t len)
 {
@@ -302,15 +333,59 @@ static const char *FormatName(DXGI_FORMAT f)
     case DXGI_FORMAT_R8G8B8A8_UNORM:        return "R8G8B8A8_UNORM";
     case DXGI_FORMAT_R8G8B8A8_TYPELESS:     return "R8G8B8A8_TYPELESS";
     case DXGI_FORMAT_R32G32B32A32_FLOAT:    return "R32G32B32A32_FLOAT";
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS: return "R32G32B32A32_TYPELESS";
+    case DXGI_FORMAT_R16_FLOAT:             return "R16_FLOAT";
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:   return "R8G8B8A8_UNORM_SRGB";
+    case DXGI_FORMAT_B8G8R8A8_UNORM:        return "B8G8R8A8_UNORM";
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:     return "B8G8R8A8_TYPELESS";
     case DXGI_FORMAT_R16G16_FLOAT:          return "R16G16_FLOAT";
     case DXGI_FORMAT_R16G16_TYPELESS:       return "R16G16_TYPELESS";
     case DXGI_FORMAT_R32_FLOAT:             return "R32_FLOAT";
     case DXGI_FORMAT_R32_TYPELESS:          return "R32_TYPELESS";
     case DXGI_FORMAT_D32_FLOAT:             return "D32_FLOAT";
     case DXGI_FORMAT_R24G8_TYPELESS:        return "R24G8_TYPELESS";
+    case DXGI_FORMAT_R32G8X24_TYPELESS:     return "R32G8X24_TYPELESS";
+    case DXGI_FORMAT_R24_UNORM_X8_TYPELESS: return "R24_UNORM_X8_TYPELESS";
+    case DXGI_FORMAT_R16_UNORM:             return "R16_UNORM";
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:  return "D32_FLOAT_S8X24_UINT";
+    case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS: return "R32_FLOAT_X8X24_TYPELESS";
+    case DXGI_FORMAT_R16_TYPELESS:          return "R16_TYPELESS";
+    case DXGI_FORMAT_D16_UNORM:             return "D16_UNORM";
     case DXGI_FORMAT_D24_UNORM_S8_UINT:     return "D24_UNORM_S8_UINT";
     case DXGI_FORMAT_R8_UNORM:              return "R8_UNORM";
-    default:                                return "";
+    default:                                return "unnamed";
+    }
+}
+
+// A typeless texture carries no interpretation of its bits, so nothing can build
+// a shader resource view or a typed UAV over it. The bridge used to give its
+// shared copies whatever format the game used, typeless included, and a DLSS 5
+// add-on then refused the result: "DLSS output format 1 is not a supported typed
+// codec format". Escape from Tarkov hands DLSS an R32G32B32A32_TYPELESS colour
+// buffer and an R16G16_TYPELESS motion vector buffer, so the bridge delivered
+// frames perfectly and the neural pass never ran on any of them.
+//
+// The copy is given the natural typed format of the same typeless family.
+// CopyResource checks the family, not the exact format, so it stays legal in
+// both directions, and the far side gets something it can actually view.
+static DXGI_FORMAT TypedFormat(DXGI_FORMAT f)
+{
+    switch (f)
+    {
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS: return DXGI_FORMAT_R32G32B32A32_FLOAT;
+    case DXGI_FORMAT_R32G32B32_TYPELESS:    return DXGI_FORMAT_R32G32B32_FLOAT;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case DXGI_FORMAT_R32G32_TYPELESS:       return DXGI_FORMAT_R32G32_FLOAT;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:  return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:     return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:     return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS:     return DXGI_FORMAT_B8G8R8X8_UNORM;
+    case DXGI_FORMAT_R16G16_TYPELESS:       return DXGI_FORMAT_R16G16_FLOAT;
+    case DXGI_FORMAT_R32_TYPELESS:          return DXGI_FORMAT_R32_FLOAT;
+    case DXGI_FORMAT_R8G8_TYPELESS:         return DXGI_FORMAT_R8G8_UNORM;
+    case DXGI_FORMAT_R16_TYPELESS:          return DXGI_FORMAT_R16_FLOAT;
+    case DXGI_FORMAT_R8_TYPELESS:           return DXGI_FORMAT_R8_UNORM;
+    default:                                return f;
     }
 }
 
@@ -610,6 +685,19 @@ static NVSDK_NGX_Result ForwardEvaluate(Hook &h, const char *tag, ID3D11DeviceCo
                                         const NVSDK_NGX_Handle *handle,
                                         const NVSDK_NGX_Parameter *p, void *cb)
 {
+    // A nested call means the layer above already handled this frame and is now
+    // calling down through NGX's own plumbing. Forward it and touch nothing.
+    if (g_nest > 0)
+    {
+        EnterCriticalSection(&g_hook_cs);
+        HookRemove(h);
+        NVSDK_NGX_Result inner = reinterpret_cast<PFN_Evaluate>(h.target)(ctx, handle, p, cb);
+        HookRestore(h);
+        LeaveCriticalSection(&g_hook_cs);
+        return inner;
+    }
+    NestGuard nest;
+
     const LONG n = InterlockedIncrement(&g_eval_count);
     if (n <= 5 || (n % 1800) == 0)
     {
@@ -638,6 +726,13 @@ static NVSDK_NGX_Result ForwardEvaluate(Hook &h, const char *tag, ID3D11DeviceCo
         Log("--- EvaluateFeature #%ld returned %d%s ---", n, r,
             suppress ? " (game's own DLSS suppressed)" : "");
 
+    // Worth saying in words. If the game's own DLSS is already failing, the
+    // contract was broken before this add-on touched it, and chasing the bridge
+    // is chasing the wrong thing.
+    if (!suppress && r != NGX_SUCCESS && n <= 5)
+        Log("  the game's own DLSS call failed (0x%08X), before the bridge changed "
+            "anything. Whatever is wrong is wrong upstream of it.", r);
+
     // The bridge runs after the game's own evaluate has been forwarded, so the
     // game's Color holds this frame's input and its Output can be replaced.
     // stage=0 is documented as fully inert and has to mean it: opening the D3D12
@@ -655,21 +750,21 @@ static NVSDK_NGX_Result ForwardEvaluate(Hook &h, const char *tag, ID3D11DeviceCo
     return r;
 }
 
-static NVSDK_NGX_Result Detour_Evaluate(ID3D11DeviceContext *ctx, const NVSDK_NGX_Handle *handle,
-                                        const NVSDK_NGX_Parameter *p, void *cb)
-{
-    return ForwardEvaluate(g_hk_eval, "NVSDK_NGX_D3D11_EvaluateFeature", ctx, handle, p, cb);
-}
-
-static NVSDK_NGX_Result Detour_Evaluate_C(ID3D11DeviceContext *ctx, const NVSDK_NGX_Handle *handle,
-                                          const NVSDK_NGX_Parameter *p, void *cb)
-{
-    return ForwardEvaluate(g_hk_eval_c, "NVSDK_NGX_D3D11_EvaluateFeature_C", ctx, handle, p, cb);
-}
-
-static NVSDK_NGX_Result Detour_Create(ID3D11DeviceContext *ctx, int feature_id,
+static NVSDK_NGX_Result ForwardCreate(Hook &h, ID3D11DeviceContext *ctx, int feature_id,
                                       NVSDK_NGX_Parameter *p, NVSDK_NGX_Handle **out)
 {
+    if (g_nest > 0)
+    {
+        EnterCriticalSection(&g_hook_cs);
+        HookRemove(h);
+        NVSDK_NGX_Result inner =
+            reinterpret_cast<PFN_Create>(h.target)(ctx, feature_id, p, out);
+        HookRestore(h);
+        LeaveCriticalSection(&g_hook_cs);
+        return inner;
+    }
+    NestGuard nest;
+
     Breadcrumb("forwarding the game's DLSS create");
     const LONG n = InterlockedIncrement(&g_create_count);
     Log("=== CreateFeature #%ld  feature_id=%d ===", n, feature_id);
@@ -688,15 +783,52 @@ static NVSDK_NGX_Result Detour_Create(ID3D11DeviceContext *ctx, int feature_id,
     }
 
     EnterCriticalSection(&g_hook_cs);
-    HookRemove(g_hk_create);
-    NVSDK_NGX_Result r = reinterpret_cast<PFN_Create>(g_hk_create.target)(ctx, feature_id, p, out);
-    HookRestore(g_hk_create);
+    HookRemove(h);
+    NVSDK_NGX_Result r = reinterpret_cast<PFN_Create>(h.target)(ctx, feature_id, p, out);
+    HookRestore(h);
     LeaveCriticalSection(&g_hook_cs);
 
     Log("=== CreateFeature #%ld returned %d, handle=%p ===", n, r,
         (out != nullptr && *out != nullptr) ? static_cast<void *>(*out) : nullptr);
     return r;
 }
+
+// One detour per layer, because a detour has to know which layer's saved bytes
+// to restore before forwarding, and the entry point itself carries no way to
+// tell. Eight sets of three is duplication a macro can carry; the alternative is
+// hand-written thunks in assembly.
+#define LAYER_DETOURS(i)                                                             \
+    static NVSDK_NGX_Result Detour_Evaluate_##i(                                     \
+        ID3D11DeviceContext *c, const NVSDK_NGX_Handle *h,                           \
+        const NVSDK_NGX_Parameter *p, void *cb)                                      \
+    { return ForwardEvaluate(g_layer[i].eval,                                        \
+                             "NVSDK_NGX_D3D11_EvaluateFeature", c, h, p, cb); }      \
+    static NVSDK_NGX_Result Detour_Evaluate_C_##i(                                   \
+        ID3D11DeviceContext *c, const NVSDK_NGX_Handle *h,                           \
+        const NVSDK_NGX_Parameter *p, void *cb)                                      \
+    { return ForwardEvaluate(g_layer[i].eval_c,                                      \
+                             "NVSDK_NGX_D3D11_EvaluateFeature_C", c, h, p, cb); }    \
+    static NVSDK_NGX_Result Detour_Create_##i(                                       \
+        ID3D11DeviceContext *c, int f, NVSDK_NGX_Parameter *p, NVSDK_NGX_Handle **o) \
+    { return ForwardCreate(g_layer[i].create, c, f, p, o); }
+
+LAYER_DETOURS(0) LAYER_DETOURS(1) LAYER_DETOURS(2)  LAYER_DETOURS(3)
+LAYER_DETOURS(4) LAYER_DETOURS(5) LAYER_DETOURS(6)  LAYER_DETOURS(7)
+LAYER_DETOURS(8) LAYER_DETOURS(9) LAYER_DETOURS(10) LAYER_DETOURS(11)
+
+struct DetourSet
+{
+    PFN_Evaluate eval;
+    PFN_Evaluate eval_c;
+    PFN_Create   create;
+};
+
+#define LAYER_ENTRY(i) { &Detour_Evaluate_##i, &Detour_Evaluate_C_##i, &Detour_Create_##i }
+static const DetourSet kDetour[kMaxLayers] = {
+    LAYER_ENTRY(0), LAYER_ENTRY(1), LAYER_ENTRY(2),  LAYER_ENTRY(3),
+    LAYER_ENTRY(4), LAYER_ENTRY(5), LAYER_ENTRY(6),  LAYER_ENTRY(7),
+    LAYER_ENTRY(8), LAYER_ENTRY(9), LAYER_ENTRY(10), LAYER_ENTRY(11),
+};
 
 // ---------------------------------------------------------------------------
 // Module discovery
@@ -708,58 +840,100 @@ typedef BOOL (WINAPI *PFN_EnumProcessModules)(HANDLE, HMODULE *, DWORD, LPDWORD)
 // links the static NGX library, in the game executable itself -- which is where
 // BG3 keeps them. Rather than guess, walk every loaded module and take whichever
 // one exports the symbol.
-static HMODULE FindNgxModule(void **out_eval, void **out_eval_c, void **out_create)
+// Hooks every module that exports the NGX D3D11 API and is not already hooked,
+// and returns how many were added this pass. Modules appear at different times
+// -- a game's own exports are there from the start, the feature snippet only
+// once DLSS initialises -- so this runs again on every DLL load.
+//
+// Earlier builds picked one module and tried to reason about which layer the
+// caller would enter. That reasoning was wrong for Trails (hooked too low) and
+// wrong for Skyrim (hooked too high). The layers are indistinguishable from the
+// outside, so all of them are hooked and g_nest decides at call time.
+static void LogPrologue(const char *label, const BYTE *p);
+
+static int HookNewNgxModules()
 {
     HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
-    if (k32 == nullptr) return nullptr;
+    if (k32 == nullptr) return 0;
     auto enum_modules =
         reinterpret_cast<PFN_EnumProcessModules>(GetProcAddress(k32, "K32EnumProcessModules"));
-    if (enum_modules == nullptr) return nullptr;
+    if (enum_modules == nullptr) return 0;
 
     HMODULE mods[1024];
     DWORD   needed = 0;
     if (!enum_modules(GetCurrentProcess(), mods, sizeof(mods), &needed))
-        return nullptr;
+        return 0;
 
+    int added = 0;
     const DWORD count = needed / sizeof(HMODULE);
     for (DWORD i = 0; i < count; ++i)
     {
+        if (g_layer_count >= kMaxLayers)
+        {
+            static bool said = false;
+            if (!said) { said = true; Log("  layer table full at %d; later modules "
+                                          "exporting NGX are NOT hooked.", kMaxLayers); }
+            break;
+        }
+
         void *eval   = reinterpret_cast<void *>(GetProcAddress(mods[i], "NVSDK_NGX_D3D11_EvaluateFeature"));
         void *eval_c = reinterpret_cast<void *>(GetProcAddress(mods[i], "NVSDK_NGX_D3D11_EvaluateFeature_C"));
         void *create = reinterpret_cast<void *>(GetProcAddress(mods[i], "NVSDK_NGX_D3D11_CreateFeature"));
         if (create == nullptr || (eval == nullptr && eval_c == nullptr)) continue;
 
-        // The feature snippets -- nvngx_dlss.dll and friends -- export the same
-        // symbols as the loader that calls them, so matching on exports alone
-        // can pick the layer underneath the one the game actually calls. Hooking
-        // there intercepts NGX's own internal calls instead, and a snippet
-        // shipped alongside a game can be a different build from the driver's.
-        // Skip them: the right target is the caller's side, not the callee's.
+        bool known = false;
+        for (LONG k = 0; k < g_layer_count && !known; ++k)
+            known = (g_layer[k].mod == mods[i]);
+        if (known) continue;
+
         wchar_t path[MAX_PATH] = {};
         GetModuleFileNameW(mods[i], path, MAX_PATH);
         const wchar_t *leaf = wcsrchr(path, L'\\');
         leaf = leaf ? leaf + 1 : path;
-        // The snippets are not only the nvngx_*.dll in a game folder. NGX also
-        // loads its downloaded models out of ProgramData as .bin files that are
-        // really DLLs, and those export the full API too. Matching on the name
-        // alone missed them.
-        const wchar_t *ext = wcsrchr(leaf, L'.');
-        const bool snippet = (_wcsnicmp(leaf, L"nvngx_", 6) == 0) ||
-                             (ext != nullptr && _wcsicmp(ext, L".bin") == 0) ||
-                             (wcsstr(path, L"\\NGX\\models\\") != nullptr);
-        if (snippet)
-        {
-            Log("  skipping %ls: that is an NGX feature snippet, not the entry point "
-                "the game calls.", leaf);
-            continue;
-        }
 
-        *out_eval   = eval;
-        *out_eval_c = eval_c;
-        *out_create = create;
-        return mods[i];
+        // The downloaded models under ProgramData are DLLs that export the full
+        // API too, but nothing ever calls them as an entry point. They would eat
+        // layer slots the real callers need.
+        const wchar_t *ext = wcsrchr(leaf, L'.');
+        if ((ext != nullptr && _wcsicmp(ext, L".bin") == 0) ||
+            wcsstr(path, L"\\NGX\\models\\") != nullptr)
+            continue;
+
+        // Some builds export both names at the same address. Patching one
+        // address twice would save the first patch as the second's original
+        // bytes and leave the function permanently redirected.
+        if (eval_c == eval) eval_c = nullptr;
+
+        const LONG slot = g_layer_count;
+        Layer &L = g_layer[slot];
+        L.mod = mods[i];
+
+        Log("NGX layer %ld: %ls (base=%p)", slot, path, static_cast<void *>(mods[i]));
+        Log("  NVSDK_NGX_D3D11_CreateFeature     = %p", create);
+        Log("  NVSDK_NGX_D3D11_EvaluateFeature   = %p", eval);
+        Log("  NVSDK_NGX_D3D11_EvaluateFeature_C = %p", eval_c);
+        if (create != nullptr) LogPrologue("CreateFeature", static_cast<const BYTE *>(create));
+        if (eval   != nullptr) LogPrologue("EvaluateFeature", static_cast<const BYTE *>(eval));
+        if (eval_c != nullptr) LogPrologue("EvaluateFeature_C", static_cast<const BYTE *>(eval_c));
+
+        EnterCriticalSection(&g_hook_cs);
+        const bool ok_create = create != nullptr &&
+            HookInstall(L.create, create, reinterpret_cast<void *>(kDetour[slot].create));
+        const bool ok_eval = eval != nullptr &&
+            HookInstall(L.eval, eval, reinterpret_cast<void *>(kDetour[slot].eval));
+        const bool ok_eval_c = eval_c != nullptr &&
+            HookInstall(L.eval_c, eval_c, reinterpret_cast<void *>(kDetour[slot].eval_c));
+        LeaveCriticalSection(&g_hook_cs);
+
+        Log("  hooked: CreateFeature=%s EvaluateFeature=%s EvaluateFeature_C=%s",
+            ok_create ? "yes" : "FAILED",
+            eval   != nullptr ? (ok_eval   ? "yes" : "FAILED") : "absent",
+            eval_c != nullptr ? (ok_eval_c ? "yes" : "FAILED") : "absent");
+
+        InterlockedIncrement(&g_layer_count);
+        ++added;
     }
-    return nullptr;
+    return added;
 }
 
 static void LogPrologue(const char *label, const BYTE *p)
@@ -912,46 +1086,60 @@ typedef LONG (NTAPI *PFN_LdrUnregisterDllNotification)(void *);
 static void *g_ldr_cookie;
 static PFN_LdrUnregisterDllNotification g_ldr_unregister;
 static volatile LONG g_hooks_installed;
+static ULONGLONG     g_hook_time;
+static volatile LONG g_idle_reported;
 
 // Safe to call repeatedly and from the loader callback: it does nothing once
 // the hooks are in, and everything it does before that is a name lookup.
 static void TryInstallHooks()
 {
-    if (InterlockedCompareExchange(&g_hooks_installed, 0, 0) != 0) return;
-
-    void   *eval = nullptr, *eval_c = nullptr, *create = nullptr;
-    HMODULE ngx = FindNgxModule(&eval, &eval_c, &create);
-    if (ngx == nullptr) return;
-    if (InterlockedCompareExchange(&g_hooks_installed, 1, 0) != 0) return;
-
-    wchar_t path[MAX_PATH] = {};
-    GetModuleFileNameW(ngx, path, MAX_PATH);
-    Log("Found NGX module: %ls (base=%p)", path, static_cast<void *>(ngx));
-    Log("  NVSDK_NGX_D3D11_CreateFeature     = %p", create);
-    Log("  NVSDK_NGX_D3D11_EvaluateFeature   = %p", eval);
-    Log("  NVSDK_NGX_D3D11_EvaluateFeature_C = %p", eval_c);
-    if (create != nullptr) LogPrologue("CreateFeature", static_cast<const BYTE *>(create));
-    if (eval   != nullptr) LogPrologue("EvaluateFeature", static_cast<const BYTE *>(eval));
-    if (eval_c != nullptr) LogPrologue("EvaluateFeature_C", static_cast<const BYTE *>(eval_c));
+    // Not "once and done" any more. The game's own exports are present from the
+    // start, but the feature snippet underneath only shows up when DLSS
+    // initialises, so every load is another chance to find a layer.
+    if (g_layer_count >= kMaxLayers) return;
 
     EnterCriticalSection(&g_hook_cs);
-    const bool ok_create = create != nullptr &&
-        HookInstall(g_hk_create, create, reinterpret_cast<void *>(&Detour_Create));
-    const bool ok_eval = eval != nullptr &&
-        HookInstall(g_hk_eval, eval, reinterpret_cast<void *>(&Detour_Evaluate));
-    const bool ok_eval_c = eval_c != nullptr &&
-        HookInstall(g_hk_eval_c, eval_c, reinterpret_cast<void *>(&Detour_Evaluate_C));
+    const int added = HookNewNgxModules();
     LeaveCriticalSection(&g_hook_cs);
+    if (added == 0) return;
 
-    Log("Hooks installed: CreateFeature=%s EvaluateFeature=%s EvaluateFeature_C=%s",
-        ok_create ? "yes" : "FAILED", ok_eval ? "yes" : "FAILED", ok_eval_c ? "yes" : "FAILED");
+    if (InterlockedCompareExchange(&g_hooks_installed, 1, 0) != 0) return;
+
+    g_hook_time = GetTickCount64();
+
+    // Streamline is a second, parallel way to reach DLSS. A game or mod using it
+    // never calls the functions above, so the hooks are in and nothing arrives --
+    // which looks identical to DLSS simply being switched off. Say which it is.
+    if (GetModuleHandleW(L"sl.interposer.dll") != nullptr)
+        Log("  sl.interposer.dll is loaded here, so DLSS in this game may go through "
+            "Streamline instead. Streamline does not call the functions above and the "
+            "bridge cannot see it.");
+}
+
+// The "nothing ever called us" diagnosis used to be written only at unload, and
+// most games never run DLL detach -- so the one log that needed it said nothing.
+// Report it as soon as it is true instead. There is no timer thread to hang it
+// on by design, so it rides the loader notification: a game doing anything at
+// all keeps loading DLLs.
+static void ReportIdle()
+{
+    if (InterlockedCompareExchange(&g_hooks_installed, 0, 0) == 0) return;
+    if (g_eval_count != 0) return;
+    if (GetTickCount64() - g_hook_time < 60000) return;
+    if (InterlockedCompareExchange(&g_idle_reported, 1, 0) != 0) return;
+
+    Log("");
+    Log("60 seconds after hooking, nothing has called DLSS through these entry points.");
+    Log("  Not a hooking problem. Either DLSS is off in the game's own settings, or");
+    Log("  whatever provides it does not use the D3D11 NGX exports -- Streamline and");
+    Log("  D3D12 both go elsewhere. The bridge only works from a D3D11 NGX call.");
 }
 
 static void CALLBACK OnDllLoaded(ULONG reason, const void *, void *)
 {
     // 1 is LDR_DLL_NOTIFICATION_REASON_LOADED. This runs under the loader lock,
     // so it does the least it can: a name lookup, and the hook writes.
-    if (reason == 1) TryInstallHooks();
+    if (reason == 1) { TryInstallHooks(); ReportIdle(); }
 }
 
 static void StartWatchingForNgx()
@@ -990,7 +1178,8 @@ static void ReportOutcome()
         Log("  NGX path -- Streamline and D3D12 both bypass these functions.");
         LogNgxCandidates();
     }
-    else if (g_eval_count == 0)
+    else if (g_eval_count == 0 &&
+             InterlockedCompareExchange(&g_idle_reported, 1, 0) == 0)
     {
         Log("");
         Log("The entry points were hooked but nothing ever called DLSS through them.");
@@ -1123,10 +1312,14 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         ReportOutcome();
 
         EnterCriticalSection(&g_hook_cs);
-        HookRemove(g_hk_eval);
-        HookRemove(g_hk_eval_c);
-        HookRemove(g_hk_create);
-        g_hk_eval.active = g_hk_eval_c.active = g_hk_create.active = false;
+        for (LONG i = 0; i < g_layer_count; ++i)
+        {
+            HookRemove(g_layer[i].eval);
+            HookRemove(g_layer[i].eval_c);
+            HookRemove(g_layer[i].create);
+            g_layer[i].eval.active = g_layer[i].eval_c.active =
+                g_layer[i].create.active = false;
+        }
         LeaveCriticalSection(&g_hook_cs);
         if (g_unregister != nullptr) g_unregister(g_self);
 
