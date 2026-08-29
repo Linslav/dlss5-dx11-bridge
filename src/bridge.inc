@@ -332,23 +332,56 @@ static void LogVideoMemory(const char *when)
 // DXGI_ERROR_DEVICE_HUNG about twenty seconds in, and nothing else about it is
 // known. This must be switched on before the device exists, so it is done here
 // rather than where the removal is noticed.
+// Prey 2017 faults inside D3D12Core.dll here, which no HRESULT reports.
+static HRESULT SafeCreateDevice(PFN_D3D12CreateDevice_ fn, IDXGIAdapter *ad,
+                                ID3D12Device **out, DWORD *code)
+{
+    *code = 0;
+    __try { return fn(ad, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
+                      reinterpret_cast<void **>(out)); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return E_FAIL; }
+}
+
+static bool EnableDredGuarded(HMODULE d3d12, DWORD *code)
+{
+    *code = 0;
+    __try
+    {
+        auto get_debug = reinterpret_cast<HRESULT (WINAPI *)(REFIID, void **)>(
+            GetProcAddress(d3d12, "D3D12GetDebugInterface"));
+        if (get_debug == nullptr) return false;
+
+        ID3D12DeviceRemovedExtendedDataSettings *set = nullptr;
+        if (FAILED(get_debug(__uuidof(ID3D12DeviceRemovedExtendedDataSettings),
+                             reinterpret_cast<void **>(&set))) || set == nullptr)
+            return false;
+
+        set->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+        set->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+        set->Release();
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        *code = GetExceptionCode();
+        return false;
+    }
+}
+
 static void EnableDred(HMODULE d3d12)
 {
-    auto get_debug = reinterpret_cast<HRESULT (WINAPI *)(REFIID, void **)>(
-        GetProcAddress(d3d12, "D3D12GetDebugInterface"));
-    if (get_debug == nullptr)
-    { Log("[bridge] DRED is unavailable: d3d12.dll exports no debug interface."); return; }
-
-    ID3D12DeviceRemovedExtendedDataSettings *set = nullptr;
-    if (FAILED(get_debug(__uuidof(ID3D12DeviceRemovedExtendedDataSettings),
-                         reinterpret_cast<void **>(&set))) || set == nullptr)
-    { Log("[bridge] DRED is unavailable on this Windows build."); return; }
-
-    set->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-    set->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-    set->Release();
-    Log("[bridge] DRED is on: if the GPU is reset, what it was executing will be "
-        "recorded here.");
+    DWORD code = 0;
+    if (EnableDredGuarded(d3d12, &code))
+    {
+        Log("[bridge] DRED is on: if the GPU is reset, what it was executing will be "
+            "recorded here.");
+        return;
+    }
+    if (code != 0)
+        Log("[bridge] enabling DRED raised 0x%08X. It is only a diagnostic, so it is "
+            "left off and the session continues without it.", code);
+    else
+        Log("[bridge] DRED is unavailable on this Windows and driver combination.");
 }
 
 // The breadcrumb history is a list of these, and a bare number in a report
@@ -445,6 +478,42 @@ typedef HRESULT (WINAPI *PFN_D3DCompile_)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHA
                                           ID3DInclude *, LPCSTR, LPCSTR, UINT, UINT,
                                           ID3DBlob **, ID3DBlob **);
 
+// LoadLibraryW searches the executable's directory first, so a game shipping
+// its own d3dcompiler_47.dll hands us that one -- whatever it was built from,
+// years ago. The Elder Scrolls Online ships one, and renaming it away is what
+// made ESO work with this add-on loaded. Microsoft's copy in System32 is the
+// only one we have any reason to want: these two shaders are ours, compiled
+// once per session, and nothing about them needs a game's compiler.
+static PFN_D3DCompile_ LoadSystemD3DCompiler()
+{
+    static PFN_D3DCompile_ cached;
+    static bool            tried;
+    if (tried) return cached;
+    tried = true;
+
+    HMODULE m = LoadLibraryExW(L"d3dcompiler_47.dll", nullptr,
+                               LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (m == nullptr)
+    {
+        // Older Windows without LOAD_LIBRARY_SEARCH_SYSTEM32 support falls back
+        // to the plain search, which is what this add-on did everywhere until
+        // now. Say which one was taken either way.
+        m = LoadLibraryW(L"d3dcompiler_47.dll");
+        if (m != nullptr)
+            Log("[bridge] d3dcompiler_47.dll loaded by the default search order; "
+                "a copy in the game folder wins over the one in System32.");
+    }
+    if (m == nullptr) return nullptr;
+
+    wchar_t path[MAX_PATH] = {};
+    GetModuleFileNameW(m, path, MAX_PATH);
+    Log("[bridge] shader compiler: %ls", path);
+
+    cached = reinterpret_cast<PFN_D3DCompile_>(GetProcAddress(m, "D3DCompile"));
+    return cached;
+}
+
+
 static bool BridgeMakeDepthShader(ID3D11Device *dev11)
 {
     if (g_bridge.depth_cs != nullptr) return true;
@@ -459,9 +528,7 @@ static bool BridgeMakeDepthShader(ID3D11Device *dev11)
         "    if (id.x < w && id.y < h) dst[id.xy] = src[id.xy];\n"
         "}\n";
 
-    HMODULE m = LoadLibraryW(L"d3dcompiler_47.dll");
-    auto compile = m != nullptr
-        ? reinterpret_cast<PFN_D3DCompile_>(GetProcAddress(m, "D3DCompile")) : nullptr;
+    PFN_D3DCompile_ compile = LoadSystemD3DCompiler();
     if (compile == nullptr) { Log("[bridge] d3dcompiler_47.dll unavailable"); return false; }
 
     ID3DBlob *code = nullptr, *err = nullptr;
@@ -590,9 +657,7 @@ static bool BridgeMakeMVShader(ID3D11Device *dev11)
         "    if (id.x < w && id.y < h) dst[id.xy] = src[id.xy];\n"
         "}\n";
 
-    HMODULE m = LoadLibraryW(L"d3dcompiler_47.dll");
-    auto compile = m != nullptr
-        ? reinterpret_cast<PFN_D3DCompile_>(GetProcAddress(m, "D3DCompile")) : nullptr;
+    PFN_D3DCompile_ compile = LoadSystemD3DCompiler();
     if (compile == nullptr) { Log("[bridge] d3dcompiler_47.dll unavailable"); return false; }
 
     ID3DBlob *code = nullptr, *err = nullptr;
@@ -826,12 +891,32 @@ static bool BridgeInitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
         ? reinterpret_cast<PFN_D3D12CreateDevice_>(GetProcAddress(d3d12, "D3D12CreateDevice"))
         : nullptr;
     if (create_device == nullptr) { Log("[bridge] no D3D12CreateDevice"); goto fail; }
+
+    // Prey 2017 faults inside D3D12Core.dll during this call, on the same driver
+    // that four other titles open a session on without trouble. It is also the
+    // only reported process carrying two third-party NGX exporters besides the
+    // driver and the snippets -- a winmm proxy injector and the Luma add-on --
+    // and an injector that has hooked device creation would fault here exactly
+    // like this. Whether the function has been patched before us is one line to
+    // establish and was never printed.
+    LogPrologue("D3D12CreateDevice", reinterpret_cast<const BYTE *>(create_device));
+    Log("[bridge]   ReShade hooks this function by design, so a jump here is normal "
+        "and Baldur's Gate 3 shows one while working. What is worth comparing "
+        "between reports is the bytes, not the fact of a jump: a second hook on "
+        "top of ReShade's is what a game-side injector would leave.");
     if (g_cfg.dred != 0) EnableDred(d3d12);
     else Log("[bridge] DRED is off by config; a GPU reset will not be explained.");
 
     {
-        HRESULT hr = create_device(adapter, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
-                                   reinterpret_cast<void **>(&g_bridge.dev12));
+        DWORD dcode = 0;
+        HRESULT hr = SafeCreateDevice(create_device, adapter, &g_bridge.dev12, &dcode);
+        if (dcode != 0)
+        {
+            Log("[bridge] D3D12CreateDevice raised 0x%08X inside the D3D12 runtime. "
+                "Nothing this add-on can do about that, so it stops here and the "
+                "game keeps its own rendering.", dcode);
+            goto fail;
+        }
         if (FAILED(hr) || g_bridge.dev12 == nullptr)
         { Log("[bridge] D3D12CreateDevice failed 0x%08X", hr); goto fail; }
 
@@ -1752,20 +1837,41 @@ static void NoteAbsentParam(const char *key)
     for (int i = 0; i < count; ++i)
         if (strcmp(seen[i], key) == 0) return;
     if (count < static_cast<int>(_countof(seen))) seen[count++] = key;
-    Log("[bridge] the game sets no %s, so neither does this bridge: NGX then uses "
-        "the same default the game's own DLSS call gets.", key);
+    Log("[bridge] the game sets no %s; the neutral from nvsdk_ngx_helpers.h is sent "
+        "instead, which is what a game using the official helper would send.", key);
 }
 
-static void MirrorFloatParam(const NVSDK_NGX_Parameter *src, const char *key)
+// Sends the game's value where it has one, and the neutral from
+// nvsdk_ngx_helpers.h where it does not -- which is what every game using the
+// official helper sends. Absence is still reported once per key, because that
+// report is what found the MV.Scale defect in the first place.
+static void NeutralFloatParam(const NVSDK_NGX_Parameter *src, const char *key,
+                              float neutral)
 {
     float v = 0.0f;
-    if (src->Get(key, &v) != NGX_SUCCESS) { NoteAbsentParam(key); return; }
+    if (src->Get(key, &v) != NGX_SUCCESS || v == 0.0f)
+    {
+        NoteAbsentParam(key);
+        v = neutral;
+    }
     g_bridge.params->Set(key, v);
 }
 
-static void MirrorUIntParam(const NVSDK_NGX_Parameter *src, const char *key)
+static void NeutralUIntParam(const NVSDK_NGX_Parameter *src, const char *key,
+                             unsigned int neutral)
 {
     unsigned int v = 0;
+    if (src->Get(key, &v) != NGX_SUCCESS) { NoteAbsentParam(key); v = neutral; }
+    g_bridge.params->Set(key, v);
+}
+
+// Jitter and sharpness are the two the helper passes straight through with no
+// substitution, so there is no neutral to fall back on and a wrong value is
+// worse than none. Every game that runs DLSS sets jitter; sharpness matters
+// only with DoSharpening, which such a game also sets.
+static void MirrorFloatParam(const NVSDK_NGX_Parameter *src, const char *key)
+{
+    float v = 0.0f;
     if (src->Get(key, &v) != NGX_SUCCESS) { NoteAbsentParam(key); return; }
     g_bridge.params->Set(key, v);
 }
@@ -2104,21 +2210,21 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
     // sets none -- taking information away from whatever reads the block after us.
     CopyUIntParam(gp, "DLSS.Render.Subrect.Dimensions.Width", g_bridge.render_w);
     CopyUIntParam(gp, "DLSS.Render.Subrect.Dimensions.Height", g_bridge.render_h);
-    MirrorUIntParam(gp, "DLSS.Input.Color.Subrect.Base.X");
-    MirrorUIntParam(gp, "DLSS.Input.Color.Subrect.Base.Y");
-    MirrorUIntParam(gp, "DLSS.Input.Depth.Subrect.Base.X");
-    MirrorUIntParam(gp, "DLSS.Input.Depth.Subrect.Base.Y");
-    MirrorUIntParam(gp, "DLSS.Input.MV.Subrect.Base.X");
-    MirrorUIntParam(gp, "DLSS.Input.MV.Subrect.Base.Y");
-    MirrorUIntParam(gp, "DLSS.Output.Subrect.Base.X");
-    MirrorUIntParam(gp, "DLSS.Output.Subrect.Base.Y");
-    MirrorFloatParam(gp, "MV.Scale.X");
-    MirrorFloatParam(gp, "MV.Scale.Y");
+    NeutralUIntParam(gp, "DLSS.Input.Color.Subrect.Base.X", 0u);
+    NeutralUIntParam(gp, "DLSS.Input.Color.Subrect.Base.Y", 0u);
+    NeutralUIntParam(gp, "DLSS.Input.Depth.Subrect.Base.X", 0u);
+    NeutralUIntParam(gp, "DLSS.Input.Depth.Subrect.Base.Y", 0u);
+    NeutralUIntParam(gp, "DLSS.Input.MV.Subrect.Base.X", 0u);
+    NeutralUIntParam(gp, "DLSS.Input.MV.Subrect.Base.Y", 0u);
+    NeutralUIntParam(gp, "DLSS.Output.Subrect.Base.X", 0u);
+    NeutralUIntParam(gp, "DLSS.Output.Subrect.Base.Y", 0u);
+    NeutralFloatParam(gp, "MV.Scale.X", 1.0f);
+    NeutralFloatParam(gp, "MV.Scale.Y", 1.0f);
     MirrorFloatParam(gp, "Jitter.Offset.X");
     MirrorFloatParam(gp, "Jitter.Offset.Y");
     MirrorFloatParam(gp, "Sharpness");
-    MirrorFloatParam(gp, "DLSS.Pre.Exposure");
-    MirrorFloatParam(gp, "DLSS.Exposure.Scale");
+    NeutralFloatParam(gp, "DLSS.Pre.Exposure", 1.0f);
+    NeutralFloatParam(gp, "DLSS.Exposure.Scale", 1.0f);
 
     int reset = 0;
     gp->Get("Reset", &reset);

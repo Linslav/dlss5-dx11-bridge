@@ -39,7 +39,7 @@
 #pragma comment(lib, "version.lib")
 
 // Kept in step with version.rc, which is where ReShade's overlay reads it from.
-#define BRIDGE_VERSION "1.0.19"
+#define BRIDGE_VERSION "1.0.20"
 
 extern "C" __declspec(dllexport) const char *NAME =
     "DLSS 5 DX11 Bridge " BRIDGE_VERSION;
@@ -777,6 +777,10 @@ static void DumpCapability(NVSDK_NGX_Parameter *caps)
     }
 }
 
+// bridge.inc prints this before D3D12CreateDevice, and the include comes long
+// before the definition.
+static void LogPrologue(const char *label, const BYTE *p);
+
 #include "bridge.inc"
 
 
@@ -906,11 +910,14 @@ static void LogReShadeConfig(const wchar_t *dir)
             continue;
         }
 
-        // Every setting the DLSS 5 add-on writes begins with NR. Matching on the
-        // prefix rather than a fixed list keeps this working when it gains a
-        // setting, and the section name is logged so a coincidence is readable
-        // as one rather than mistaken for the add-on.
-        if (b[0] != 'N' || b[1] != 'R') continue;
+        // The whole of the DLSS 5 add-on's own section, rather than keys
+        // beginning NR: version 3.3.5 introduced EnableHooks, which decides
+        // whether it hooks anything at all, and a prefix filter would have left
+        // the single most important setting out of every report. The section
+        // name has to be exact -- "[RenoDX" also matches [renodx-preset1],
+        // which belongs to a different add-on and is forty lines of colour
+        // grading.
+        if (_stricmp(section, "[RenoDX.DLSS5]") != 0) continue;
         if (strchr(b, '=') == nullptr) continue;
 
         if (!header)
