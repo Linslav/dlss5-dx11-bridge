@@ -100,37 +100,23 @@ and a timing line every 600 frames:
 
 ## Performance
 
-Baldur's Gate 3, one machine, one scene, camera still, no frame cap. Each row is
-the median of four consecutive 600-frame windows, switched live through `stage`
-so nothing but this add-on changes between them.
+The cost is the neural-rendering work itself, not the transport. That much is
+reproducible: with the evaluate disabled but the D3D12 device, queue and
+allocators all created (`stage=2`), the frame time is indistinguishable from the
+add-on being fully inert (`stage=0`). CPU time inside this add-on is well under a
+millisecond per frame.
 
-| `stage` | What runs | Frame interval | fps | Spread |
-| --- | --- | --- | --- | --- |
-| 0 | nothing at all | 9.10 ms | 109.9 | 5.17–15.98 ms |
-| 2 | the D3D12 device exists; no evaluate, no per-frame fence | 9.06 ms | 110.4 | 4.86–19.01 ms |
-| 3 | everything | 15.99 ms | 62.6 | 5.74–30.16 ms |
+How much the neural pass costs depends on the scene, the resolution, the GPU and
+the DLSS 5 add-on's own settings, and it varies enough between areas of the same
+game that a single number would mislead. Measure it where you play:
 
-Two things follow.
+- set `stage=0` in `dlss5-dx11-bridge.cfg`, stand still, read a timing line
+- set `stage=3`, do not move, read another
 
-**The transport is free.** `stage=0` and `stage=2` are the same measurement. The
-second D3D12 device, its queue and its allocators cost nothing while they sit
-idle, so the whole cost is the neural work itself. CPU time inside this add-on
-is 0.84 ms per frame at `stage=3`, about 5% of the frame; the rest is GPU.
-
-**It is not a small cost.** 110 fps to 62 in this scene. Earlier figures in this
-file reported a smaller loss because they were taken against a 120 fps cap that
-hid the headroom being consumed.
-
-The spread column is the widest and narrowest gap between consecutive frames in
-each window. Relative to its own frame rate the full bridge is the *steadier* of
-the three — max over mean is 1.87–1.90 at `stage=3` against 1.66–2.44 at
-`stage=2` — so the wider absolute spread is the frame rate halving, not pacing
-being disturbed. That matters if a driver-side frame generator is interpolating
-between these frames: it receives a slower but more regular sequence, and what
-becomes visible is its own interpolation rather than any jitter introduced here.
-
-`skip_game=1`, the default, avoids running the game's own DLSS pass as well as
-this one; it was worth about 1.5 ms per frame when measured separately.
+The file is re-read while the game runs, so both readings come from one session
+and one spot. The timing line reports the frame interval and the spread between
+consecutive frames; the spread matters if a driver-side frame generator is
+interpolating between them.
 
 ## Related
 
