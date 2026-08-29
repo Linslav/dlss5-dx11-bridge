@@ -38,7 +38,7 @@
 #include <cstdint>
 
 // Kept in step with version.rc, which is where ReShade's overlay reads it from.
-#define BRIDGE_VERSION "1.0.8"
+#define BRIDGE_VERSION "1.0.9"
 
 extern "C" __declspec(dllexport) const char *NAME =
     "DLSS 5 DX11 Bridge " BRIDGE_VERSION;
@@ -201,7 +201,10 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
         GetModuleFileNameW(mod, owner, MAX_PATH);
 
     Log("");
-    Log("################ the game is crashing ################");
+    // A marker the next run looks for. Recording a crash when one actually
+    // happens is reliable; inferring one from a missing clean-exit marker is
+    // not, because plenty of games terminate without ever running DLL detach.
+    Log("### CRASH RECORDED ###");
     Log("  exception 0x%08X at %p", code, addr);
     Log("  in: %ls", owner);
     Log("  this add-on was last doing: %s", g_where);
@@ -889,29 +892,37 @@ static void LogNgxCandidates()
         Log("    none. NGX is not loaded in this process, so DLSS has not been "
             "initialised -- check that DLSS is actually enabled in the game.");
 }
-static DWORD WINAPI WatcherThread(LPVOID)
+// ---------------------------------------------------------------------------
+// Finding NGX
+//
+// NGX is loaded well after the process starts, so the entry points are not
+// there to hook at attach time. This used to poll on a background thread, which
+// was wrong: an add-on can be unloaded at any moment -- Skyrim loads and drops
+// them inside a 400 ms hardware-detection pass -- and a thread still executing
+// inside the module when it leaves memory kills the process.
+//
+// The loader will say when a library arrives instead. No thread, so no window
+// in which the module can vanish underneath one, and unregistering is ordered.
+// ---------------------------------------------------------------------------
+
+typedef void (CALLBACK *PFN_LdrDllNotification)(ULONG reason, const void *data, void *ctx);
+typedef LONG (NTAPI *PFN_LdrRegisterDllNotification)(ULONG, PFN_LdrDllNotification, void *, void **);
+typedef LONG (NTAPI *PFN_LdrUnregisterDllNotification)(void *);
+
+static void *g_ldr_cookie;
+static PFN_LdrUnregisterDllNotification g_ldr_unregister;
+static volatile LONG g_hooks_installed;
+
+// Safe to call repeatedly and from the loader callback: it does nothing once
+// the hooks are in, and everything it does before that is a name lookup.
+static void TryInstallHooks()
 {
-    void *eval = nullptr, *eval_c = nullptr, *create = nullptr;
-    HMODULE ngx = nullptr;
+    if (InterlockedCompareExchange(&g_hooks_installed, 0, 0) != 0) return;
 
-    // DLSS is initialised well after process start, and how long that takes
-    // varies wildly -- a first launch compiling shaders can take many minutes.
-    // So this never gives up; it just slows down and says what it can see.
-    for (int i = 0; ngx == nullptr; ++i)
-    {
-        ngx = FindNgxModule(&eval, &eval_c, &create);
-        if (ngx != nullptr) break;
-
-        if (i == 600)
-        {
-            Log("Still waiting for the game's NGX D3D11 entry points after 60 s. "
-                "This is normal while loading; it becomes a problem only if DLSS "
-                "is on and gameplay has started.");
-            LogNgxCandidates();
-            Log("  will keep checking every 2 s.");
-        }
-        Sleep(i < 600 ? 100 : 2000);
-    }
+    void   *eval = nullptr, *eval_c = nullptr, *create = nullptr;
+    HMODULE ngx = FindNgxModule(&eval, &eval_c, &create);
+    if (ngx == nullptr) return;
+    if (InterlockedCompareExchange(&g_hooks_installed, 1, 0) != 0) return;
 
     wchar_t path[MAX_PATH] = {};
     GetModuleFileNameW(ngx, path, MAX_PATH);
@@ -934,20 +945,58 @@ static DWORD WINAPI WatcherThread(LPVOID)
 
     Log("Hooks installed: CreateFeature=%s EvaluateFeature=%s EvaluateFeature_C=%s",
         ok_create ? "yes" : "FAILED", ok_eval ? "yes" : "FAILED", ok_eval_c ? "yes" : "FAILED");
+}
 
-    // Hooked but never called is a completely different problem from never
-    // hooking, and the two are indistinguishable in a log that says nothing.
-    Sleep(60000);
-    if (g_eval_count == 0)
+static void CALLBACK OnDllLoaded(ULONG reason, const void *, void *)
+{
+    // 1 is LDR_DLL_NOTIFICATION_REASON_LOADED. This runs under the loader lock,
+    // so it does the least it can: a name lookup, and the hook writes.
+    if (reason == 1) TryInstallHooks();
+}
+
+static void StartWatchingForNgx()
+{
+    HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    auto reg = nt != nullptr ? reinterpret_cast<PFN_LdrRegisterDllNotification>(
+        GetProcAddress(nt, "LdrRegisterDllNotification")) : nullptr;
+    g_ldr_unregister = nt != nullptr ? reinterpret_cast<PFN_LdrUnregisterDllNotification>(
+        GetProcAddress(nt, "LdrUnregisterDllNotification")) : nullptr;
+
+    if (reg != nullptr) reg(0, &OnDllLoaded, nullptr, &g_ldr_cookie);
+    else Log("loader notifications unavailable; NGX will only be found if it is already loaded");
+
+    // It may already be there, in which case no notification is coming.
+    TryInstallHooks();
+}
+
+static void StopWatchingForNgx()
+{
+    if (g_ldr_cookie != nullptr && g_ldr_unregister != nullptr)
+    {
+        g_ldr_unregister(g_ldr_cookie);
+        g_ldr_cookie = nullptr;
+    }
+}
+
+// Said at unload, when the answer is finally known, rather than guessed at from
+// a timer partway through.
+static void ReportOutcome()
+{
+    if (InterlockedCompareExchange(&g_hooks_installed, 0, 0) == 0)
     {
         Log("");
-        Log("60 s after hooking, nothing has called DLSS through these entry points.");
-        Log("  The hooks are in place, so this is not a hooking problem. Either DLSS");
-        Log("  is switched off in the game, or whatever provides it is not using the");
-        Log("  D3D11 NGX path -- Streamline and D3D12 both bypass these functions.");
+        Log("NGX D3D11 entry points never appeared while this add-on was loaded.");
+        Log("  Either DLSS was off, or whatever provides it does not use the D3D11");
+        Log("  NGX path -- Streamline and D3D12 both bypass these functions.");
         LogNgxCandidates();
     }
-    return 0;
+    else if (g_eval_count == 0)
+    {
+        Log("");
+        Log("The entry points were hooked but nothing ever called DLSS through them.");
+        Log("  Not a hooking problem. Either DLSS is off in the game, or the call");
+        Log("  goes somewhere else.");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1016,25 +1065,32 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         if (!RegisterWithReShade(module))
             return FALSE;  // ReShade will unload us; do not leave hooks behind
 
-        // Read the old log before replacing it, then start a fresh one.
-        char carried[1024] = {};
+        // Carry forward the previous run's crash report, if it left one. This
+        // looks for a marker the crash handler writes, not for the absence of a
+        // clean-exit marker: many games terminate the process without ever
+        // running DLL detach, so absence proves nothing and reporting it would
+        // claim a crash on every ordinary launch.
+        char carried[2048] = {};
         {
             FILE *old = nullptr;
             if (fopen_s(&old, g_log_path, "r") == 0 && old != nullptr)
             {
-                char line[512]; bool clean = false; char tail[512] = {};
+                char line[512];
+                bool in_report = false;
                 while (fgets(line, sizeof(line), old) != nullptr)
                 {
-                    if (strstr(line, "shut down cleanly") != nullptr) clean = true;
-                    strcpy_s(tail, line);
+                    if (strstr(line, "### CRASH RECORDED ###") != nullptr)
+                    {
+                        in_report = true;
+                        carried[0] = '\0';
+                        continue;
+                    }
+                    if (in_report && strstr(line, "####") != nullptr) break;
+                    if (in_report) strcat_s(carried, line);
                 }
                 fclose(old);
-                if (!clean && tail[0] != '\0')
-                {
-                    if (char *nl = strchr(tail, '\n')) *nl = '\0';
-                    _snprintf_s(carried, sizeof(carried), _TRUNCATE, "%s", tail);
-                }
             }
+
             FILE *f = nullptr;
             if (fopen_s(&f, g_log_path, "w") == 0 && f != nullptr) fclose(f);
         }
@@ -1046,8 +1102,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         Log("dlss5-dx11-bridge %s (built %s %s) attached.", BRIDGE_VERSION, __DATE__, __TIME__);
         if (carried[0] != '\0')
         {
-            Log("The previous run did not shut down cleanly -- it may have crashed.");
-            Log("  its last line was: %s", carried);
+            Log("The previous run crashed. What it recorded at the time:");
+            Log("%s", carried);
         }
 
         LogEnvironment();
@@ -1057,10 +1113,15 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         // exists even in a game where nothing ever hooks -- and so stage=0 is
         // available as an off switch before launching, without deleting this.
         CfgWriteDefault();
-        CreateThread(nullptr, 0, &WatcherThread, nullptr, 0, nullptr);
+        StartWatchingForNgx();
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
+        // Stop being told about new libraries before anything else, so no
+        // callback can arrive while the rest of this is tearing down.
+        StopWatchingForNgx();
+        ReportOutcome();
+
         EnterCriticalSection(&g_hook_cs);
         HookRemove(g_hk_eval);
         HookRemove(g_hk_eval_c);
