@@ -392,6 +392,7 @@ static ID3D11Texture2D *GameTexture(const NVSDK_NGX_Parameter *p, const char *ke
 static bool BridgeInitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
 {
     Log("");
+    Breadcrumb("opening the D3D12 session");
     Log("################ bridge: opening D3D12 session ################");
     CfgReload();
     Log("[bridge] config: mode=%d flags=%d subrects=%d reset_every=%d pixels=%d",
@@ -470,6 +471,7 @@ static bool BridgeInitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
         auto init_project = reinterpret_cast<PFN_Init_ProjectID>(
             GetProcAddress(ngx, "NVSDK_NGX_D3D12_Init_ProjectID"));
 
+        Breadcrumb("initialising NGX on D3D12");
         DWORD code   = 0;
         bool  inited = false;
         for (int ver = 0x13; ver <= 0x16 && !inited; ++ver)
@@ -696,6 +698,7 @@ static bool MakeSharedPair(ID3D11Device *dev11, ID3D11Device1 *dev1, int i,
 // area is smaller than the texture that holds it.
 static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt)
 {
+    Breadcrumb("building shared textures");
     const UINT w = g_bridge.width, h = g_bridge.height;
     BridgeReleaseTextures();
 
@@ -798,6 +801,7 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt)
     if (!BeginCommands()) { Log("[bridge] could not start a command list"); return false; }
 
     DWORD code = 0;
+    Breadcrumb("creating the D3D12 DLSS feature");
     NVSDK_NGX_Result rf = SafeCreateFeature(g_bridge.create_feature, g_bridge.list,
                                             g_bridge.params, &g_bridge.feature, &code);
     const UINT64 v = EndCommands();
@@ -1086,6 +1090,7 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
     const int mode = g_cfg.mode;
 
     DWORD code = 0;
+    Breadcrumb("running the D3D12 evaluate");
     NVSDK_NGX_Result re = NGX_SUCCESS;
     if (mode != 1)
         re = SafeEvaluateGuarded(g_bridge.eval_feature, g_bridge.list,

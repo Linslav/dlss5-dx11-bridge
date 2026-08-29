@@ -38,7 +38,7 @@
 #include <cstdint>
 
 // Kept in step with version.rc, which is where ReShade's overlay reads it from.
-#define BRIDGE_VERSION "1.0.7"
+#define BRIDGE_VERSION "1.0.8"
 
 extern "C" __declspec(dllexport) const char *NAME =
     "DLSS 5 DX11 Bridge " BRIDGE_VERSION;
@@ -166,6 +166,54 @@ static void Warn(const char *fmt, ...)
         g_reshade_log(g_reshade_module, 1 /* error */, tagged);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Crash reporting
+//
+// Reports so far have all ended the same way: a log that simply stops, with no
+// way to tell whether the game died there or the file was just truncated when
+// it was copied. These three pieces answer that without having to ask.
+//
+// The breadcrumb names what was last being attempted, the filter records where
+// a fatal exception actually landed and in whose code, and the next run says
+// whether the previous one ended cleanly.
+// ---------------------------------------------------------------------------
+
+static const char *volatile g_where = "starting up";
+
+static void Breadcrumb(const char *what) { g_where = what; }
+
+static LPTOP_LEVEL_EXCEPTION_FILTER g_prev_filter;
+
+static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
+{
+    const void *addr = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : nullptr;
+    const DWORD code = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0;
+
+    // Whose code faulted matters more than the address itself: it separates a
+    // bug in here from one in the game, the driver, or another add-on.
+    wchar_t owner[MAX_PATH] = L"unknown";
+    HMODULE mod = nullptr;
+    if (addr != nullptr &&
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           static_cast<LPCWSTR>(addr), &mod) && mod != nullptr)
+        GetModuleFileNameW(mod, owner, MAX_PATH);
+
+    Log("");
+    Log("################ the game is crashing ################");
+    Log("  exception 0x%08X at %p", code, addr);
+    Log("  in: %ls", owner);
+    Log("  this add-on was last doing: %s", g_where);
+    Log("  %s", mod == g_self ? "That address is inside this add-on, so this one is on me."
+                              : "That address is not in this add-on.");
+    Log("#####################################################");
+
+    // Always chain: games install their own crash handlers and this must not
+    // replace them.
+    return g_prev_filter != nullptr ? g_prev_filter(ep) : EXCEPTION_CONTINUE_SEARCH;
+}
+
 
 // ---------------------------------------------------------------------------
 // Inline hook
@@ -570,6 +618,7 @@ static NVSDK_NGX_Result ForwardEvaluate(Hook &h, const char *tag, ID3D11DeviceCo
     // the bridge is delivering, running it is pure waste. Suppressed only while
     // BridgeWillDeliver() holds; the moment anything goes wrong the call is
     // forwarded again and the game renders on its own.
+    Breadcrumb("forwarding the game's DLSS evaluate");
     const bool suppress = BridgeWillDeliver();
 
     NVSDK_NGX_Result r = NGX_SUCCESS;
@@ -588,7 +637,11 @@ static NVSDK_NGX_Result ForwardEvaluate(Hook &h, const char *tag, ID3D11DeviceCo
 
     // The bridge runs after the game's own evaluate has been forwarded, so the
     // game's Color holds this frame's input and its Output can be replaced.
-    if (InterlockedCompareExchange(&g_probe_done, 1, 0) == 0)
+    // stage=0 is documented as fully inert and has to mean it: opening the D3D12
+    // session creates a device and starts an NGX session, and on some drivers
+    // that is itself the thing that crashes. An off switch that still does the
+    // dangerous part is not an off switch.
+    if (g_cfg.stage >= 1 && InterlockedCompareExchange(&g_probe_done, 1, 0) == 0)
     {
         ID3D11Device *dev = nullptr;
         ctx->GetDevice(&dev);
@@ -614,6 +667,7 @@ static NVSDK_NGX_Result Detour_Evaluate_C(ID3D11DeviceContext *ctx, const NVSDK_
 static NVSDK_NGX_Result Detour_Create(ID3D11DeviceContext *ctx, int feature_id,
                                       NVSDK_NGX_Parameter *p, NVSDK_NGX_Handle **out)
 {
+    Breadcrumb("forwarding the game's DLSS create");
     const LONG n = InterlockedIncrement(&g_create_count);
     Log("=== CreateFeature #%ld  feature_id=%d ===", n, feature_id);
     DumpContext(ctx);
@@ -682,7 +736,15 @@ static HMODULE FindNgxModule(void **out_eval, void **out_eval_c, void **out_crea
         GetModuleFileNameW(mods[i], path, MAX_PATH);
         const wchar_t *leaf = wcsrchr(path, L'\\');
         leaf = leaf ? leaf + 1 : path;
-        if (_wcsnicmp(leaf, L"nvngx_", 6) == 0)
+        // The snippets are not only the nvngx_*.dll in a game folder. NGX also
+        // loads its downloaded models out of ProgramData as .bin files that are
+        // really DLLs, and those export the full API too. Matching on the name
+        // alone missed them.
+        const wchar_t *ext = wcsrchr(leaf, L'.');
+        const bool snippet = (_wcsnicmp(leaf, L"nvngx_", 6) == 0) ||
+                             (ext != nullptr && _wcsicmp(ext, L".bin") == 0) ||
+                             (wcsstr(path, L"\\NGX\\models\\") != nullptr);
+        if (snippet)
         {
             Log("  skipping %ls: that is an NGX feature snippet, not the entry point "
                 "the game calls.", leaf);
@@ -954,13 +1016,40 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         if (!RegisterWithReShade(module))
             return FALSE;  // ReShade will unload us; do not leave hooks behind
 
-        // Truncate any previous run.
-        FILE *f = nullptr;
-        if (fopen_s(&f, g_log_path, "w") == 0 && f != nullptr) fclose(f);
+        // Read the old log before replacing it, then start a fresh one.
+        char carried[1024] = {};
+        {
+            FILE *old = nullptr;
+            if (fopen_s(&old, g_log_path, "r") == 0 && old != nullptr)
+            {
+                char line[512]; bool clean = false; char tail[512] = {};
+                while (fgets(line, sizeof(line), old) != nullptr)
+                {
+                    if (strstr(line, "shut down cleanly") != nullptr) clean = true;
+                    strcpy_s(tail, line);
+                }
+                fclose(old);
+                if (!clean && tail[0] != '\0')
+                {
+                    if (char *nl = strchr(tail, '\n')) *nl = '\0';
+                    _snprintf_s(carried, sizeof(carried), _TRUNCATE, "%s", tail);
+                }
+            }
+            FILE *f = nullptr;
+            if (fopen_s(&f, g_log_path, "w") == 0 && f != nullptr) fclose(f);
+        }
+
+        g_prev_filter = SetUnhandledExceptionFilter(&CrashFilter);
 
         // First line of every log, so a report can name the build exactly,
         // followed by everything needed to diagnose a setup remotely.
         Log("dlss5-dx11-bridge %s (built %s %s) attached.", BRIDGE_VERSION, __DATE__, __TIME__);
+        if (carried[0] != '\0')
+        {
+            Log("The previous run did not shut down cleanly -- it may have crashed.");
+            Log("  its last line was: %s", carried);
+        }
+
         LogEnvironment();
         LogNeighbours();
 
@@ -979,6 +1068,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         g_hk_eval.active = g_hk_eval_c.active = g_hk_create.active = false;
         LeaveCriticalSection(&g_hook_cs);
         if (g_unregister != nullptr) g_unregister(g_self);
+
+        // The marker the next run looks for. Its absence is what says the last
+        // session ended abruptly rather than by quitting.
+        Log("shut down cleanly.");
     }
     return TRUE;
 }
