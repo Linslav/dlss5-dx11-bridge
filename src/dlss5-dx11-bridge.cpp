@@ -38,7 +38,7 @@
 #include <cstdint>
 
 // Kept in step with version.rc, which is where ReShade's overlay reads it from.
-#define BRIDGE_VERSION "1.0.13"
+#define BRIDGE_VERSION "1.0.14"
 
 extern "C" __declspec(dllexport) const char *NAME =
     "DLSS 5 DX11 Bridge " BRIDGE_VERSION;
@@ -293,6 +293,27 @@ struct Layer
 
 static Layer            g_layer[kMaxLayers];
 static volatile LONG    g_layer_count;
+
+// Modules already examined and rejected. Without this the scan re-decides them
+// on every library load and says so each time -- file writes under the loader
+// lock, dozens of them during a startup, in a process the loader lock is
+// serialising. Escape from Tarkov and The Elder Scrolls Online both showed the
+// same line forty times before anything else happened.
+static HMODULE          g_rejected[64];
+static volatile LONG    g_rejected_count;
+
+static bool AlreadyRejected(HMODULE m)
+{
+    for (LONG i = 0; i < g_rejected_count; ++i)
+        if (g_rejected[i] == m) return true;
+    return false;
+}
+
+static void RememberRejected(HMODULE m)
+{
+    if (g_rejected_count < static_cast<LONG>(_countof(g_rejected)))
+        g_rejected[g_rejected_count++] = m;
+}
 static CRITICAL_SECTION g_hook_cs;
 
 // Depth of NGX calls this thread is currently inside. Only the outermost is the
@@ -710,6 +731,23 @@ static void DumpCapability(NVSDK_NGX_Parameter *caps)
 static void RetractIdleNote();
 static void TryInstallHooks();
 
+// Handles created for a feature that is not DLSS super resolution. Their
+// parameter blocks are not an upscaling contract -- The Elder Scrolls Online
+// runs frame generation through the same D3D11 entry points -- so an evaluate
+// against one of these is forwarded and otherwise left alone. Only handles known
+// to be something else are rejected: an unrecognised handle still drives the
+// bridge, so a game whose feature was created before the hooks went in keeps
+// working exactly as before.
+static const NVSDK_NGX_Handle *g_other_feature[32];
+static volatile LONG           g_other_feature_count;
+
+static bool IsOtherFeature(const NVSDK_NGX_Handle *h)
+{
+    for (LONG i = 0; i < g_other_feature_count; ++i)
+        if (g_other_feature[i] == h) return true;
+    return false;
+}
+
 static volatile LONG g_eval_count   = 0;
 static volatile LONG g_create_count = 0;
 
@@ -756,6 +794,16 @@ static NVSDK_NGX_Result ForwardEvaluate(Hook &h, const char *tag, ID3D11DeviceCo
         HookRestore(h);
         LeaveCriticalSection(&g_hook_cs);
         return bogus;
+    }
+
+    if (IsOtherFeature(handle))
+    {
+        EnterCriticalSection(&g_hook_cs);
+        HookRemove(h);
+        NVSDK_NGX_Result other = reinterpret_cast<PFN_Evaluate>(h.target)(ctx, handle, p, cb);
+        HookRestore(h);
+        LeaveCriticalSection(&g_hook_cs);
+        return other;
     }
 
     const LONG n = InterlockedIncrement(&g_eval_count);
@@ -879,6 +927,16 @@ static NVSDK_NGX_Result ForwardCreate(Hook &h, ID3D11DeviceContext *ctx, int fea
 
     Log("=== CreateFeature #%ld returned %d, handle=%p ===", n, r,
         (out != nullptr && *out != nullptr) ? static_cast<void *>(*out) : nullptr);
+
+    // 1 is DLSS super resolution, the only feature whose contract this bridge
+    // knows how to mirror.
+    if (feature_id != 1 && r == NGX_SUCCESS && out != nullptr && *out != nullptr &&
+        g_other_feature_count < static_cast<LONG>(_countof(g_other_feature)))
+    {
+        g_other_feature[g_other_feature_count++] = *out;
+        Log("  feature %d is not super resolution; evaluates on this handle will be "
+            "forwarded and otherwise ignored.", feature_id);
+    }
     return r;
 }
 
@@ -988,7 +1046,7 @@ static int HookNewNgxModules()
 
         const bool filler = IsFillerStub(create) || IsFillerStub(eval) || IsFillerStub(eval_c);
 
-        bool known = false;
+        bool known = AlreadyRejected(mods[i]);
         for (LONG k = 0; k < g_layer_count && !known; ++k)
             known = (g_layer[k].mod == mods[i]);
         if (known) continue;
@@ -1004,7 +1062,7 @@ static int HookNewNgxModules()
         const wchar_t *ext = wcsrchr(leaf, L'.');
         if ((ext != nullptr && _wcsicmp(ext, L".bin") == 0) ||
             wcsstr(path, L"\\NGX\\models\\") != nullptr)
-            continue;
+        { RememberRejected(mods[i]); continue; }
 
         // Two of these names arriving at one address means the module is not a
         // real implementation: the driver's nvngx_dlssg.dll points both
@@ -1020,6 +1078,7 @@ static int HookNewNgxModules()
         if (filler)
         {
             Log("  skipping %ls: its NGX entry points are filler bytes, not code.", leaf);
+            RememberRejected(mods[i]);
             continue;
         }
 
@@ -1030,6 +1089,7 @@ static int HookNewNgxModules()
             Log("  skipping %ls: it exports more than one NGX entry point at %p, so "
                 "it is a placeholder rather than an implementation.", leaf,
                 eval != nullptr ? eval : eval_c);
+            RememberRejected(mods[i]);
             continue;
         }
 
@@ -1439,8 +1499,10 @@ static void ReportOutcome()
     {
         Log("");
         Log("NGX D3D11 entry points never appeared while this add-on was loaded.");
-        Log("  Either DLSS was off, or whatever provides it does not use the D3D11");
-        Log("  NGX path -- Streamline and D3D12 both bypass these functions.");
+        Log("  Nothing in this process ever provided DLSS through the D3D11 NGX path.");
+        Log("  A game with no DLSS of its own needs a mod that injects it; a game that");
+        Log("  has it needs it switched on. Streamline reaches these functions and is");
+        Log("  not the explanation; a D3D12 renderer would not, but this is a D3D11 one.");
         LogNgxCandidates();
     }
     else if (g_eval_count == 0 &&
