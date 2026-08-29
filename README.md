@@ -149,11 +149,22 @@ without a conversation:
 
 ## Confirmed working
 
-- Baldur's Gate 3 (DX11 build), native DLSS, DLAA and all quality presets
-- Fallout 4, where DLSS comes from a third-party injector rather than the game
+Reported by users, on three unrelated engines:
 
-The second one matters: it shows the bridge picks up DLSS supplied by another
-mod, not just DLSS built into the game.
+- **Baldur's Gate 3** (Divinity 4.0) — tested in depth here, native DLSS, DLAA
+  and every quality preset
+- **Fallout 4** (Creation) — DLSS supplied by a third-party injector rather
+  than by the game
+- **7 Days to Die** (Unity)
+
+Fallout 4 matters for a second reason: it shows the bridge picks up DLSS that
+another mod provides, not only DLSS built into the game.
+
+Nothing here targets a particular game. The NGX entry points are located by
+export name in whatever module exports them, and every size, format and offset
+is read from the parameter block the caller passes. Where it has failed so far
+it has been because something was hardcoded from the one game it was written
+against — see 1.0.4 — so reports from new titles are useful even when they work.
 
 ## Known limits
 
