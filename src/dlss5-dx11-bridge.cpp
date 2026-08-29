@@ -729,6 +729,31 @@ static NVSDK_NGX_Result ForwardEvaluate(Hook &h, const char *tag, ID3D11DeviceCo
     }
     NestGuard nest;
 
+    // Just Cause 3 recorded an evaluate arriving with handle=0x7 and params=0x1
+    // fourteen milliseconds after a placeholder module was hooked: not pointers,
+    // but whatever happened to be in the registers when a confused detour was
+    // entered. 1.0.11 no longer hooks such modules, but reading a parameter
+    // block through a small integer is the kind of thing that should never
+    // depend on that. The bottom 64 KB of the address space can never be mapped.
+    if (reinterpret_cast<uintptr_t>(p) < 0x10000 ||
+        reinterpret_cast<uintptr_t>(handle) < 0x10000 ||
+        reinterpret_cast<uintptr_t>(ctx) < 0x10000)
+    {
+        static LONG said = 0;
+        if (InterlockedCompareExchange(&said, 1, 0) == 0)
+            Log("[bridge] an evaluate arrived with handle=%p params=%p ctx=%p -- none of "
+                "those can be real. Forwarding it untouched and ignoring it.",
+                static_cast<const void *>(handle), static_cast<const void *>(p),
+                static_cast<void *>(ctx));
+
+        EnterCriticalSection(&g_hook_cs);
+        HookRemove(h);
+        NVSDK_NGX_Result bogus = reinterpret_cast<PFN_Evaluate>(h.target)(ctx, handle, p, cb);
+        HookRestore(h);
+        LeaveCriticalSection(&g_hook_cs);
+        return bogus;
+    }
+
     const LONG n = InterlockedIncrement(&g_eval_count);
     if (n <= 5 || (n % 1800) == 0)
     {
