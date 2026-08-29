@@ -182,7 +182,7 @@ static bool BridgeWillDeliver()
 {
     return g_cfg.skip_game != 0 && g_cfg.mode == 2 && g_cfg.stage >= 3 &&
            !g_bridge.disabled && g_bridge.session_ready && g_bridge.frame_ready &&
-           g_bridge.frames_done > 0;
+           !g_bridge.partial_output && g_bridge.frames_done > 0;
 }
 
 static void CfgPath(char *out)
@@ -1690,6 +1690,39 @@ static void CopyUIntParam(const NVSDK_NGX_Parameter *src, const char *key, unsig
     g_bridge.params->Set(key, v);
 }
 
+
+// A parameter the game did not set is not a parameter whose default this bridge
+// gets to choose. Trails beyond the Horizon sets no MV.Scale, and the -1.0
+// invented for it told DLSS to reverse every motion vector: the temporal
+// history is then gathered from the wrong side of the movement, which is the
+// smeared ground and foliage reported there. Whatever NGX does with an unset
+// parameter is exactly what the game's own DLSS call gets, so leaving it unset
+// is the only way to match. These mirror; they do not fill in.
+static void NoteAbsentParam(const char *key)
+{
+    static const char *seen[32];
+    static int         count;
+    for (int i = 0; i < count; ++i)
+        if (strcmp(seen[i], key) == 0) return;
+    if (count < static_cast<int>(_countof(seen))) seen[count++] = key;
+    Log("[bridge] the game sets no %s, so neither does this bridge: NGX then uses "
+        "the same default the game's own DLSS call gets.", key);
+}
+
+static void MirrorFloatParam(const NVSDK_NGX_Parameter *src, const char *key)
+{
+    float v = 0.0f;
+    if (src->Get(key, &v) != NGX_SUCCESS) { NoteAbsentParam(key); return; }
+    g_bridge.params->Set(key, v);
+}
+
+static void MirrorUIntParam(const NVSDK_NGX_Parameter *src, const char *key)
+{
+    unsigned int v = 0;
+    if (src->Get(key, &v) != NGX_SUCCESS) { NoteAbsentParam(key); return; }
+    g_bridge.params->Set(key, v);
+}
+
 static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter *gp)
 {
     BridgeRescueStalledQueue();
@@ -1825,6 +1858,33 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
         return;
     }
 
+    // Gallipoli's map screen creates a 1440x1440 feature while its textures stay
+    // 2560x1440: the game is drawing into a square sub-region of them. Handing
+    // DLSS the whole texture for a feature that size is the contradiction NGX
+    // answers with 0xBAD00005, and where it does not, DLSS writes 1440 columns
+    // of a 2560-wide texture and the rest stays whatever it was -- the two
+    // halves people see. The subrect origins this bridge copies all read zero,
+    // so there is nothing to place the region by. Stand aside and let the game
+    // render that screen itself.
+    const bool partial = (gow != d[SLOT_OUTPUT].Width) || (goh != d[SLOT_OUTPUT].Height);
+    g_bridge.partial_output = partial;
+    if (partial)
+    {
+        if (!g_bridge.partial_reported)
+        {
+            g_bridge.partial_reported = true;
+            Log("[bridge] the game asks for a %ux%u result inside a %ux%u texture, so "
+                "it is drawing into part of it. Filling only that part would leave "
+                "the rest of the frame stale, and where the region sits is not in "
+                "the parameters. The game renders these frames itself.",
+                gow, goh, d[SLOT_OUTPUT].Width, d[SLOT_OUTPUT].Height);
+        }
+        g_bridge.frame_ready = false;
+        for (int i = 0; i < SLOT_COUNT; ++i) g[i]->Release();
+        dev11->Release();
+        return;
+    }
+
     bool shape_changed = (gw != g_bridge.render_w)  || (gh != g_bridge.render_h) ||
                          (gow != g_bridge.ngx_out_w) || (goh != g_bridge.ngx_out_h);
     // Every slot's own size, not only Color's and Output's. Depth or motion
@@ -1876,6 +1936,7 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
         g_bridge.render_h   = gh;
         g_bridge.ngx_out_w  = gow;
         g_bridge.ngx_out_h  = goh;
+
         Log("[bridge] rebuilding: render %ux%u -> %ux%u", gw, gh, gow, goh);
         if (!BridgeBuildResources(dev11, fmt, gp))
         {
@@ -1967,23 +2028,23 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
     // Mirror the game's own subrect description rather than inventing one. In an
     // upscaling preset the rendered area is a corner of a larger texture, and
     // guessing it is what made DLSS Quality produce a soft, effect-free image.
-    CopyUIntParam(gp, "DLSS.Render.Subrect.Dimensions.Width", g_bridge.render_w);
-    CopyUIntParam(gp, "DLSS.Render.Subrect.Dimensions.Height", g_bridge.render_h);
-    CopyUIntParam(gp, "DLSS.Input.Color.Subrect.Base.X", 0u);
-    CopyUIntParam(gp, "DLSS.Input.Color.Subrect.Base.Y", 0u);
-    CopyUIntParam(gp, "DLSS.Input.Depth.Subrect.Base.X", 0u);
-    CopyUIntParam(gp, "DLSS.Input.Depth.Subrect.Base.Y", 0u);
-    CopyUIntParam(gp, "DLSS.Input.MV.Subrect.Base.X", 0u);
-    CopyUIntParam(gp, "DLSS.Input.MV.Subrect.Base.Y", 0u);
-    CopyUIntParam(gp, "DLSS.Output.Subrect.Base.X", 0u);
-    CopyUIntParam(gp, "DLSS.Output.Subrect.Base.Y", 0u);
-    CopyFloatParam(gp, "MV.Scale.X", -1.0f);
-    CopyFloatParam(gp, "MV.Scale.Y", -1.0f);
-    CopyFloatParam(gp, "Jitter.Offset.X", 0.0f);
-    CopyFloatParam(gp, "Jitter.Offset.Y", 0.0f);
-    CopyFloatParam(gp, "Sharpness", 0.0f);
-    CopyFloatParam(gp, "DLSS.Pre.Exposure", 1.0f);
-    CopyFloatParam(gp, "DLSS.Exposure.Scale", 1.0f);
+    MirrorUIntParam(gp, "DLSS.Render.Subrect.Dimensions.Width");
+    MirrorUIntParam(gp, "DLSS.Render.Subrect.Dimensions.Height");
+    MirrorUIntParam(gp, "DLSS.Input.Color.Subrect.Base.X");
+    MirrorUIntParam(gp, "DLSS.Input.Color.Subrect.Base.Y");
+    MirrorUIntParam(gp, "DLSS.Input.Depth.Subrect.Base.X");
+    MirrorUIntParam(gp, "DLSS.Input.Depth.Subrect.Base.Y");
+    MirrorUIntParam(gp, "DLSS.Input.MV.Subrect.Base.X");
+    MirrorUIntParam(gp, "DLSS.Input.MV.Subrect.Base.Y");
+    MirrorUIntParam(gp, "DLSS.Output.Subrect.Base.X");
+    MirrorUIntParam(gp, "DLSS.Output.Subrect.Base.Y");
+    MirrorFloatParam(gp, "MV.Scale.X");
+    MirrorFloatParam(gp, "MV.Scale.Y");
+    MirrorFloatParam(gp, "Jitter.Offset.X");
+    MirrorFloatParam(gp, "Jitter.Offset.Y");
+    MirrorFloatParam(gp, "Sharpness");
+    MirrorFloatParam(gp, "DLSS.Pre.Exposure");
+    MirrorFloatParam(gp, "DLSS.Exposure.Scale");
 
     int reset = 0;
     gp->Get("Reset", &reset);

@@ -39,7 +39,7 @@
 #pragma comment(lib, "version.lib")
 
 // Kept in step with version.rc, which is where ReShade's overlay reads it from.
-#define BRIDGE_VERSION "1.0.17"
+#define BRIDGE_VERSION "1.0.18"
 
 extern "C" __declspec(dllexport) const char *NAME =
     "DLSS 5 DX11 Bridge " BRIDGE_VERSION;

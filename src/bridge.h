@@ -48,6 +48,15 @@ struct Bridge
     bool      pause_reported;
     bool      resume_reported;
 
+    // The feature covers only part of the output texture. Gallipoli's map screen
+    // creates a 1440x1440 feature while its textures stay 2560x1440: it draws
+    // into a square sub-region. Handing DLSS the whole texture for a feature
+    // that size is the contradiction NGX answers with 0xBAD00005, and where it
+    // does not, DLSS writes 1440 columns of a 2560-wide texture and the rest
+    // stays whatever it was -- the two halves people see.
+    bool      partial_output;
+    bool      partial_reported;
+
     UINT      slot_w[4];
     UINT      slot_h[4];
 
