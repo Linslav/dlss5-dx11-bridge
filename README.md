@@ -108,6 +108,14 @@ cost is the DLSS and neural-rendering work itself.
 
 `skip_game=1` is worth about 1.5 ms per frame.
 
+## Related
+
+[dlss5-d3d12-fix](https://github.com/NIGos/dlss5-d3d12-fix) fixes a different
+failure of the same add-on: a DirectX 12 game whose DLSS output carries a mip
+chain, which that add-on requires to be single-mip and silently refuses. If the
+panel says STANDBY/FAILED rather than waiting for the game's DLSS, that is the
+one to use.
+
 ## Building
 
 Windows SDK and MSVC. No external dependencies; the ReShade add-on API is
