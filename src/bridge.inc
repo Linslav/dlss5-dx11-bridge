@@ -37,6 +37,10 @@ static NVSDK_NGX_Result SafeEvaluateGuarded(PFN_D3D12EvaluateFeature fn,
 //                  verifying it against a non-executable System32 image map.
 //                  The detour is restored immediately, including after a
 //                  caught exception. Diagnostic only, and fail-closed.
+//   sync=1         wait on the CPU for each D3D12 output fence, with a 2 s
+//                  timeout, instead of placing an uncancellable wait on the
+//                  game's D3D11 queue. Diagnostic only: slower, but a stalled
+//                  private queue cannot permanently black-screen the game.
 //   flags=-1       DLSS.Feature.Create.Flags. -1 copies whatever the game
 //                  asked for, which is the only value guaranteed to describe
 //                  the game's own buffers. Any other value forces that value:
@@ -108,9 +112,10 @@ struct BridgeCfg
     int unwrap;
     int adapter;
     int d3d12_hook;
+    int sync;
 };
 
-static BridgeCfg g_cfg = { 2, -1, 1, 0, 0, 3, 1, 1, 1, 1, 0, 0 };
+static BridgeCfg g_cfg = { 2, -1, 1, 0, 0, 3, 1, 1, 1, 1, 0, 0, 0 };
 
 // Accumulates the two figures and reports them together, because either one
 // alone is misleading.
@@ -255,6 +260,7 @@ static void CfgReload()
         else if (_stricmp(key, "unwrap")      == 0) next.unwrap      = val;
         else if (_stricmp(key, "adapter")     == 0) next.adapter     = val;
         else if (_stricmp(key, "d3d12_hook")  == 0) next.d3d12_hook = val;
+        else if (_stricmp(key, "sync")        == 0) next.sync        = val;
         else if (_stricmp(key, "subrects")    == 0) next.subrects    = val;
         else if (_stricmp(key, "reset_every") == 0) next.reset_every = val;
         else if (_stricmp(key, "pixels")      == 0) next.pixels      = val;
@@ -267,6 +273,7 @@ static void CfgReload()
     if (next.mode < 0 || next.mode > 2) next.mode = g_cfg.mode;
     if (next.adapter < 0 || next.adapter > 2) next.adapter = g_cfg.adapter;
     if (next.d3d12_hook < 0 || next.d3d12_hook > 1) next.d3d12_hook = g_cfg.d3d12_hook;
+    if (next.sync < 0 || next.sync > 1) next.sync = g_cfg.sync;
 
     const bool rebuild = (next.flags != g_cfg.flags) || (next.subrects != g_cfg.subrects);
     const bool changed = rebuild || (next.mode != g_cfg.mode) ||
@@ -274,15 +281,16 @@ static void CfgReload()
                          (next.stage != g_cfg.stage) || (next.skip_game != g_cfg.skip_game) ||
                          (next.dred != g_cfg.dred) || (next.skip_exe != g_cfg.skip_exe) ||
                          (next.unwrap != g_cfg.unwrap) || (next.adapter != g_cfg.adapter) ||
-                         (next.d3d12_hook != g_cfg.d3d12_hook);
+                         (next.d3d12_hook != g_cfg.d3d12_hook) ||
+                         (next.sync != g_cfg.sync);
     if (!changed) return;
 
     g_cfg = next;
     Log("[bridge] config: stage=%d mode=%d flags=%d subrects=%d reset_every=%d pixels=%d "
-        "skip_game=%d dred=%d skip_exe=%d unwrap=%d adapter=%d d3d12_hook=%d",
+        "skip_game=%d dred=%d skip_exe=%d unwrap=%d adapter=%d d3d12_hook=%d sync=%d",
         g_cfg.stage, g_cfg.mode, g_cfg.flags, g_cfg.subrects, g_cfg.reset_every, g_cfg.pixels,
         g_cfg.skip_game, g_cfg.dred, g_cfg.skip_exe, g_cfg.unwrap, g_cfg.adapter,
-        g_cfg.d3d12_hook);
+        g_cfg.d3d12_hook, g_cfg.sync);
 
     // Creation-time values only take effect on a new feature, so invalidate the
     // current one and let the next frame build it again.
@@ -297,10 +305,10 @@ static void CfgWriteDefault()
 
     FILE *f = nullptr;
     if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
-    fprintf(f, "stage=%d\nmode=%d\nskip_game=%d\nflags=%d\nsubrects=%d\nreset_every=%d\npixels=%d\ndred=%d\nskip_exe=%d\nunwrap=%d\nadapter=%d\nd3d12_hook=%d\n",
+    fprintf(f, "stage=%d\nmode=%d\nskip_game=%d\nflags=%d\nsubrects=%d\nreset_every=%d\npixels=%d\ndred=%d\nskip_exe=%d\nunwrap=%d\nadapter=%d\nd3d12_hook=%d\nsync=%d\n",
             g_cfg.stage, g_cfg.mode, g_cfg.skip_game, g_cfg.flags, g_cfg.subrects,
             g_cfg.reset_every, g_cfg.pixels, g_cfg.dred, g_cfg.skip_exe, g_cfg.unwrap,
-            g_cfg.adapter, g_cfg.d3d12_hook);
+            g_cfg.adapter, g_cfg.d3d12_hook, g_cfg.sync);
     fclose(f);
     Log("[bridge] wrote default config to %s", path);
 }
@@ -2850,12 +2858,39 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
         // a GPU-side wait has no timeout and cannot be cancelled, so if the
         // D3D12 side never reaches v_out the game's queue stops for good.
         // BridgeRescueStalledQueue watches this value on later frames.
-        g_bridge.ctx4->Wait(g_bridge.fence11, v_out);
-        // Always the newest value: fences are monotonic, so signalling the
-        // latest satisfies every wait queued behind it. The deadline is not
-        // armed here -- BridgeRescueStalledQueue keeps it, against the last time
-        // the GPU completed anything at all.
-        g_bridge.pending_out = v_out;
+        if (g_cfg.sync != 0)
+        {
+            // Never enqueue a wait on the game's queue in this diagnostic mode:
+            // if the private D3D12 queue stalls, that wait cannot be cancelled
+            // and Present never returns. This is slower but bounded.
+            HRESULT whr = g_bridge.fence12->SetEventOnCompletion(
+                v_out, g_bridge.fence_event);
+            const DWORD wr = SUCCEEDED(whr)
+                           ? WaitForSingleObject(g_bridge.fence_event, 2000)
+                           : WAIT_FAILED;
+            const UINT64 completed = g_bridge.fence12->GetCompletedValue();
+            if (FAILED(whr) || wr != WAIT_OBJECT_0 || completed < v_out)
+            {
+                Log("[bridge] sync=1: D3D12 output fence %llu did not complete "
+                    "within 2 s (completed %llu, SetEvent 0x%08X, wait %lu).",
+                    v_out, completed, whr, static_cast<unsigned long>(wr));
+                if (completed == UINT64_MAX) BridgeDeviceLost();
+                else BridgeDisable("the CPU-synchronised D3D12 frame timed out");
+                for (int i = 0; i < SLOT_COUNT; ++i) g[i]->Release();
+                dev11->Release();
+                return;
+            }
+            g_bridge.pending_out = 0;
+        }
+        else
+        {
+            g_bridge.ctx4->Wait(g_bridge.fence11, v_out);
+            // Always the newest value: fences are monotonic, so signalling the
+            // latest satisfies every wait queued behind it. The deadline is not
+            // armed here -- BridgeRescueStalledQueue keeps it, against the last time
+            // the GPU completed anything at all.
+            g_bridge.pending_out = v_out;
+        }
 
         const UINT64 n = ++g_bridge.frames_done;
 

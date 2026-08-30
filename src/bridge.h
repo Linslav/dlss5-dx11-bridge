@@ -10,7 +10,8 @@
 //   1. copy the game's Color / Depth / MotionVectors into shared textures
 //   2. signal a shared fence on the D3D11 immediate context
 //   3. wait on it from the D3D12 queue, run the D3D12 evaluate, signal back
-//   4. wait on the D3D11 context, copy the result into the game's Output
+//   4. wait on the D3D11 context, or on the CPU in diagnostic sync mode, then
+//      copy the result into the game's Output
 //
 // The textures are created on the D3D12 side with D3D12_HEAP_FLAG_SHARED and
 // opened as D3D11 aliases, because the game's own textures carry MiscFlags = 0

@@ -80,6 +80,7 @@ trigger a rebuild automatically.
 | `pixels` | 0 | `1` reads pixels back to the CPU for debugging. Stalls the GPU hard. |
 | `adapter` | 0 | Experimental device selection: `0` uses the game adapter (upstream), `1` asks Windows for the default adapter, and `2` retries with the default adapter only after a caught game-adapter fault. Takes effect when a new D3D12 session opens. |
 | `d3d12_hook` | 0 | Diagnostic only. `1` bypasses a verified five-byte `D3D12CreateDevice` entry detour for the guarded device-creation call, then restores it immediately. Any unexpected byte pattern fails closed and leaves the hook in place. |
+| `sync` | 0 | Diagnostic only. `1` waits on the CPU for each D3D12 output fence with a two-second timeout instead of adding an uncancellable wait to the game's D3D11 queue. It is slower, but a stalled private queue cannot permanently black-screen the game. |
 
 ### Final Fantasy XV diagnostic build
 
