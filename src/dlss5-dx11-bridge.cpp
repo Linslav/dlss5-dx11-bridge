@@ -39,7 +39,7 @@
 #pragma comment(lib, "version.lib")
 
 // Kept in step with version.rc, which is where ReShade's overlay reads it from.
-#define BRIDGE_VERSION "1.0.26"
+#define BRIDGE_VERSION "1.0.27"
 
 extern "C" __declspec(dllexport) const char *NAME =
     "DLSS 5 DX11 Bridge " BRIDGE_VERSION;
@@ -669,6 +669,14 @@ static void DumpEvaluate(ID3D11DeviceContext *ctx, const NVSDK_NGX_Handle *handl
     DumpTexture(p, "DLSS.TransparencyLayerOpacity");
     DumpTexture(p, "DLSS.TransparencyLayerMvecs");
 
+    // Set by Ray Reconstruction and by nothing else. If one of these is present
+    // the evaluate is a denoise, not an upscale, and the bridge stands aside for
+    // it -- so a log that shows them also shows why nothing was mirrored.
+    DumpTexture(p, "NormalRoughness");
+    DumpTexture(p, "DiffuseAlbedo");
+    DumpTexture(p, "SpecularAlbedo");
+    DumpTexture(p, "SpecularHitDistance");
+
     Log("  scalars:");
     DumpUInt(p, "Width");
     DumpUInt(p, "Height");
@@ -1161,6 +1169,51 @@ static bool IsOtherFeature(const NVSDK_NGX_Handle *h)
     return false;
 }
 
+// A Ray Reconstruction evaluate hands over the same Color, Depth, MotionVectors
+// and Output as a super-resolution one, so the four resources this bridge reads
+// cannot tell the two apart. Mirroring a denoise onto a super-resolution feature
+// upscales input that is still noisy and then copies the result over the output
+// the game had already denoised: on screen that is indistinguishable from
+// denoising switched off.
+//
+// ForwardCreate already records every feature_id other than 1, so a denoiser
+// created through these hooks is recognised by handle and never reaches here.
+// This exists for the one case that table cannot cover -- a feature created
+// before the hooks went in -- which is exactly the case the comment above
+// g_other_feature says keeps driving the bridge.
+//
+// Only resource keys are probed. The matrices a denoiser also sets are float
+// arrays, and asking for one through a resource accessor answers a question
+// nobody asked. Both spellings are listed because a key this runtime does not
+// have answers UnsupportedParameter: a wrong name costs one failed call and can
+// only ever produce a false negative.
+static const char *const kDenoiserKeys[] = {
+    "NormalRoughness",       "DLSSD.NormalRoughness",
+    "DiffuseAlbedo",         "DLSSD.DiffuseAlbedo",
+    "SpecularAlbedo",        "DLSSD.SpecularAlbedo",
+    "SpecularHitDistance",   "DLSSD.SpecularHitDistance",
+    "SpecularMotionVectors", "DLSSD.SpecularMotionVectors",
+    "GBuffer.Normals",       "GBuffer.Roughness",
+};
+
+// Returns the key that matched, or nullptr. Probed on every evaluate rather than
+// cached against the handle: NGX recycles freed handle addresses, so a cache
+// keyed on one needs the same invalidation ForwardCreate carries for
+// g_other_feature -- and writing that table from the render thread while the
+// create path writes it too is a race this does not need. Twelve calls that
+// return a result code cost nothing beside a texture copy and a DLSS evaluate.
+static const char *DenoiserKeyPresent(const NVSDK_NGX_Parameter *p)
+{
+    if (p == nullptr) return nullptr;
+    for (size_t i = 0; i < _countof(kDenoiserKeys); ++i)
+    {
+        ID3D11Resource *res = nullptr;
+        if (p->Get(kDenoiserKeys[i], &res) == NGX_SUCCESS && res != nullptr)
+            return kDenoiserKeys[i];
+    }
+    return nullptr;
+}
+
 static volatile LONG g_eval_count   = 0;
 static volatile LONG g_create_count = 0;
 
@@ -1240,6 +1293,28 @@ static NVSDK_NGX_Result ForwardEvaluate(Hook &h, const char *tag, ID3D11DeviceCo
     // the bridge is delivering, running it is pure waste. Suppressed only while
     // BridgeWillDeliver() holds; the moment anything goes wrong the call is
     // forwarded again and the game renders on its own.
+    // Ray Reconstruction rather than super resolution: forward it and touch
+    // nothing. Counted and dumped above first, so a title that only ever
+    // denoises still reports evaluates instead of tripping the idle note.
+    if (const char *dkey = DenoiserKeyPresent(p))
+    {
+        static LONG said_rr = 0;
+        if (InterlockedCompareExchange(&said_rr, 1, 0) == 0)
+            Log("[bridge] this evaluate sets \"%s\", which only the denoiser sets, so it "
+                "is Ray Reconstruction and not super resolution. Its contract is not the "
+                "one this bridge mirrors, and upscaling a still-noisy input over an "
+                "output the game already denoised would look like denoising switched "
+                "off. Forwarded untouched. The feature was created before the hooks went "
+                "in, or its handle would already be recorded.", dkey);
+
+        EnterCriticalSection(&g_hook_cs);
+        HookRemove(h);
+        NVSDK_NGX_Result denoise = reinterpret_cast<PFN_Evaluate>(h.target)(ctx, handle, p, cb);
+        HookRestore(h);
+        LeaveCriticalSection(&g_hook_cs);
+        return denoise;
+    }
+
     Breadcrumb("forwarding the game's DLSS evaluate");
     const bool suppress = BridgeWillDeliver();
 

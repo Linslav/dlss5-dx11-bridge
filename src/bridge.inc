@@ -2010,6 +2010,27 @@ static void CopyUIntParam(const NVSDK_NGX_Parameter *src, const char *key, unsig
 }
 
 
+// A note for whoever adds a second source of contract to this file.
+//
+// Everything from here down to MirrorFloatParam exists to tell "the game
+// declared X" apart from "the game declared nothing". That distinction is a
+// signal only while absence is abnormal. A synthetic contract -- ReShade depth
+// and estimated motion vectors, for a game that ships no DLSS of its own -- is a
+// legitimate second source, but it has to arrive already complete: every key set
+// explicitly by whatever builds it, and no call into the helpers below. Route one
+// through them and absence becomes a normal operating mode, NoteAbsentParam turns
+// into noise on half the frames, and the report that found the MV.Scale defect
+// stops being able to find the next one.
+//
+// The same holds for the size fallback in BridgeFrame, where absent scalars are
+// derived from the Color and Output descriptors. That is a last-resort repair for
+// a game that under-declares, not a supply route.
+//
+// DLSS.Feature.Create.Flags needs storage per source rather than one field. It
+// already carries two meanings -- the game's declared value, and 107 standing for
+// unset -- and adding an authoritative third from a synthetic source or a user
+// override to the same field is how this acquires a defect it cannot diagnose.
+
 // A parameter the game did not set is not a parameter whose default this bridge
 // gets to choose. Trails beyond the Horizon sets no MV.Scale, and the -1.0
 // invented for it told DLSS to reverse every motion vector: the temporal

@@ -132,7 +132,7 @@ and are not compiled separately.
 ```
 rc /nologo version.rc
 cl /nologo /LD /EHsc /O2 /MT dlss5-dx11-bridge.cpp ^
-   /link /OUT:dlss5-dx11-bridge.addon64 version.res kernel32.lib user32.lib
+   /link /OUT:dlss5-dx11-bridge.addon64 version.res kernel32.lib user32.lib advapi32.lib
 ```
 
 The version lives in two places that have to stay in step: `BRIDGE_VERSION` in
@@ -200,7 +200,9 @@ against — see 1.0.4 — so reports from new titles are useful even when they w
 
 - The game's DLSS runs once and the bridge's runs once; with `skip_game=1` only
   the bridge's does. There is no path that avoids a second NGX session.
-- Only tested on one game and one GPU.
+- Every fix is verified on Baldur's Gate 3 and on one GPU. The other titles in
+  the table above are user reports, so a change that works here can still be
+  wrong somewhere else.
 - Resolution changes and DLSS preset changes are handled by rebuilding, but
   alt-tab and exclusive-fullscreen transitions are not specifically handled.
 - Verbose logging is always on.
