@@ -82,6 +82,11 @@ trigger a rebuild automatically.
 | `d3d12_hook` | 0 | Diagnostic only. `1` bypasses a verified five-byte `D3D12CreateDevice` entry detour for the guarded device-creation call, then restores it immediately. Any unexpected byte pattern fails closed and leaves the hook in place. |
 | `sync` | 0 | Diagnostic only. `1` waits on the CPU for each D3D12 output fence with a two-second timeout instead of adding an uncancellable wait to the game's D3D11 queue. It is slower, but a stalled private queue cannot permanently black-screen the game. |
 
+The bridge uses separate one-direction shared fences for input and output. This
+avoids alternating D3D11 and D3D12 signal operations on the same fence, which
+the FFXV diagnostic path found could remove the private D3D12 device on frame
+two even when the submitted command list was empty.
+
 ### Final Fantasy XV diagnostic build
 
 Final Fantasy XV can raise `0xC0000005` inside `D3D12Core.dll` while creating

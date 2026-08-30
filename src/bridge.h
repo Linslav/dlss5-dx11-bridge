@@ -8,8 +8,9 @@
 //
 // Per frame:
 //   1. copy the game's Color / Depth / MotionVectors into shared textures
-//   2. signal a shared fence on the D3D11 immediate context
-//   3. wait on it from the D3D12 queue, run the D3D12 evaluate, signal back
+//   2. signal the input fence on the D3D11 immediate context
+//   3. wait on it from the D3D12 queue, run the D3D12 evaluate, then signal a
+//      separate output fence
 //   4. wait on the D3D11 context, or on the CPU in diagnostic sync mode, then
 //      copy the result into the game's Output
 //
@@ -97,6 +98,8 @@ struct Bridge
     UINT64                     alloc_fence[kFrames];
     int                        frame_slot;
     HANDLE                     fence_event;
+    ID3D12Fence               *input_fence12;
+    ID3D11Fence               *input_fence11;
     ID3D12Fence               *fence12;
     ID3D11Fence               *fence11;
     ID3D11DeviceContext4      *ctx4;
@@ -106,6 +109,7 @@ struct Bridge
     // of them still needs holding as a unit or another thread can interleave
     // into the middle of the copy / signal / copy-back run.
     ID3D11Multithread         *mt;
+    UINT64                     input_fence_value;
     UINT64                     fence_value;
 
     PFN_D3D12CreateFeature   create_feature;

@@ -1366,25 +1366,42 @@ static bool BridgeInitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
         if (g_bridge.list != nullptr) g_bridge.list->Close();
         g_bridge.fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
-        // One fence, visible to both APIs, is what orders the two queues.
-        HANDLE fh = nullptr;
+        // Keep each shared fence single-producer. Alternating signals from the
+        // D3D11 and D3D12 queues on one fence removes the D3D12 device on FFXV's
+        // driver during frame two, even with an empty command list. The input
+        // fence is signalled only by D3D11; the output fence only by D3D12 (or
+        // the CPU rescue path after a failure).
+        HANDLE fh_out = nullptr;
+        HANDLE fh_in  = nullptr;
         hr = g_bridge.dev12->CreateFence(0, D3D12_FENCE_FLAG_SHARED, __uuidof(ID3D12Fence),
                                          reinterpret_cast<void **>(&g_bridge.fence12));
         if (SUCCEEDED(hr))
             hr = g_bridge.dev12->CreateSharedHandle(g_bridge.fence12, nullptr, GENERIC_ALL,
-                                                    nullptr, &fh);
+                                                    nullptr, &fh_out);
+        if (SUCCEEDED(hr))
+            hr = g_bridge.dev12->CreateFence(0, D3D12_FENCE_FLAG_SHARED,
+                                             __uuidof(ID3D12Fence),
+                                             reinterpret_cast<void **>(&g_bridge.input_fence12));
+        if (SUCCEEDED(hr))
+            hr = g_bridge.dev12->CreateSharedHandle(g_bridge.input_fence12, nullptr,
+                                                    GENERIC_ALL, nullptr, &fh_in);
         ID3D11Device5 *dev5 = nullptr;
         if (SUCCEEDED(hr) &&
             SUCCEEDED(dev11->QueryInterface(__uuidof(ID3D11Device5), reinterpret_cast<void **>(&dev5))) &&
             dev5 != nullptr)
         {
-            hr = dev5->OpenSharedFence(fh, __uuidof(ID3D11Fence),
+            hr = dev5->OpenSharedFence(fh_out, __uuidof(ID3D11Fence),
                                        reinterpret_cast<void **>(&g_bridge.fence11));
+            if (SUCCEEDED(hr))
+                hr = dev5->OpenSharedFence(fh_in, __uuidof(ID3D11Fence),
+                                           reinterpret_cast<void **>(&g_bridge.input_fence11));
             dev5->Release();
         }
-        if (fh != nullptr) CloseHandle(fh);
-        if (FAILED(hr) || g_bridge.fence11 == nullptr)
-        { Log("[bridge] shared fence setup failed 0x%08X", hr); goto fail; }
+        if (fh_out != nullptr) CloseHandle(fh_out);
+        if (fh_in  != nullptr) CloseHandle(fh_in);
+        if (FAILED(hr) || g_bridge.fence11 == nullptr ||
+            g_bridge.input_fence11 == nullptr || g_bridge.input_fence12 == nullptr)
+        { Log("[bridge] two-fence shared setup failed 0x%08X", hr); goto fail; }
 
         if (FAILED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext4),
                                        reinterpret_cast<void **>(&g_bridge.ctx4))) ||
@@ -1410,9 +1427,12 @@ static bool BridgeInitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
         if (g_bridge.queue != nullptr) g_bridge.queue->SetName(L"dlss5-dx11-bridge queue");
         if (g_bridge.list  != nullptr) g_bridge.list->SetName(L"dlss5-dx11-bridge list");
 
-        Log("[bridge] session ready: queue=%p list=%p fence12=%p fence11=%p (%d frames in flight)",
+        Log("[bridge] session ready: queue=%p list=%p output12=%p output11=%p "
+            "input12=%p input11=%p (%d frames in flight)",
             static_cast<void *>(g_bridge.queue), static_cast<void *>(g_bridge.list),
             static_cast<void *>(g_bridge.fence12), static_cast<void *>(g_bridge.fence11),
+            static_cast<void *>(g_bridge.input_fence12),
+            static_cast<void *>(g_bridge.input_fence11),
             Bridge::kFrames);
         Log("############# bridge: session open #############");
         Log("");
@@ -2768,12 +2788,28 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
 
     // 2. publish those copies to the other queue. The flush matters: without it
     //    the signal may sit unsubmitted and the D3D12 wait never completes.
-    const UINT64 v_in = ++g_bridge.fence_value;
-    g_bridge.ctx4->Signal(g_bridge.fence11, v_in);
+    const UINT64 v_in = ++g_bridge.input_fence_value;
+    const HRESULT signal_in = g_bridge.ctx4->Signal(g_bridge.input_fence11, v_in);
+    if (FAILED(signal_in))
+    {
+        Log("[bridge] D3D11 input-fence signal %llu failed 0x%08X.", v_in, signal_in);
+        BridgeDisable("the D3D11 input fence could not be signalled");
+        for (int i = 0; i < SLOT_COUNT; ++i) g[i]->Release();
+        dev11->Release();
+        return;
+    }
     ctx->Flush();
 
     // 3. D3D12 side: wait, evaluate, signal back
-    g_bridge.queue->Wait(g_bridge.fence12, v_in);
+    const HRESULT wait_in = g_bridge.queue->Wait(g_bridge.input_fence12, v_in);
+    if (FAILED(wait_in))
+    {
+        Log("[bridge] D3D12 input-fence wait %llu failed 0x%08X.", v_in, wait_in);
+        BridgeDisable("the D3D12 queue could not wait on the input fence");
+        for (int i = 0; i < SLOT_COUNT; ++i) g[i]->Release();
+        dev11->Release();
+        return;
+    }
     if (!BeginCommands())
     {
         BridgeFail("command list");
