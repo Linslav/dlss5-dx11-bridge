@@ -275,7 +275,12 @@ static void CfgReload()
     if (next.d3d12_hook < 0 || next.d3d12_hook > 1) next.d3d12_hook = g_cfg.d3d12_hook;
     if (next.sync < 0 || next.sync > 1) next.sync = g_cfg.sync;
 
-    const bool rebuild = (next.flags != g_cfg.flags) || (next.subrects != g_cfg.subrects);
+    // mode=1 intentionally owns no NGX feature, while modes 0 and 2 do. A live
+    // transition in either direction therefore needs a resource/feature rebuild
+    // rather than reusing frame_ready with a null or stale feature handle.
+    const bool rebuild = (next.flags != g_cfg.flags) ||
+                         (next.subrects != g_cfg.subrects) ||
+                         (next.mode != g_cfg.mode);
     const bool changed = rebuild || (next.mode != g_cfg.mode) ||
                          (next.reset_every != g_cfg.reset_every) || (next.pixels != g_cfg.pixels) ||
                          (next.stage != g_cfg.stage) || (next.skip_game != g_cfg.skip_game) ||
@@ -1742,6 +1747,21 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt,
     }
     dev1->Release();
     if (!ok) { BridgeReleaseTextures(); return false; }
+
+    // mode=1 is the transport isolator. It deliberately stops at shared
+    // textures: no NGX feature creation and, in the frame path, no resource
+    // barriers or evaluate. The D3D12 submission is then an empty list between
+    // the input and output fence signals, which distinguishes a fence/share
+    // failure from an NGX or resource-state failure.
+    if (g_cfg.mode == 1)
+    {
+        for (int i = 0; i < SLOT_COUNT; ++i) g_bridge.fmt[i] = fmt[i];
+        g_bridge.need_reset  = true;
+        g_bridge.frame_ready = true;
+        Log("[bridge] transport-only resources ready; NGX feature creation is skipped.");
+        return true;
+    }
+
     // The feature is created with the game's own render and output sizes, not
     // with the texture sizes: in an upscaling mode those are not the same thing.
     g_bridge.params->Set("Width", g_bridge.render_w);
@@ -2762,14 +2782,18 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
         return;
     }
 
-    Barrier(g_bridge.list, g_bridge.tex12[SLOT_COLOR], D3D12_RESOURCE_STATE_COMMON,
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    Barrier(g_bridge.list, g_bridge.tex12[SLOT_DEPTH], D3D12_RESOURCE_STATE_COMMON,
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    Barrier(g_bridge.list, g_bridge.tex12[SLOT_MV], D3D12_RESOURCE_STATE_COMMON,
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    Barrier(g_bridge.list, g_bridge.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_COMMON,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    const int mode = g_cfg.mode;
+    if (mode != 1)
+    {
+        Barrier(g_bridge.list, g_bridge.tex12[SLOT_COLOR], D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Barrier(g_bridge.list, g_bridge.tex12[SLOT_DEPTH], D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Barrier(g_bridge.list, g_bridge.tex12[SLOT_MV], D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Barrier(g_bridge.list, g_bridge.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
 
     g_bridge.params->Set("Color", g_bridge.tex12[SLOT_COLOR]);
     g_bridge.params->Set("Output", g_bridge.tex12[SLOT_OUTPUT]);
@@ -2809,26 +2833,29 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
     g_bridge.params->Set("Reset", (g_bridge.need_reset || reset || g_cfg.reset_every) ? 1 : 0);
     g_bridge.need_reset = false;
 
-    const int mode = g_cfg.mode;
-
     DWORD code = 0;
     Breadcrumb("running the D3D12 evaluate");
     NVSDK_NGX_Result re = NGX_SUCCESS;
     static const char kNgxMark[] = "ngx evaluate";
-    g_bridge.list->BeginEvent(1, kNgxMark, sizeof(kNgxMark));
     if (mode != 1)
+    {
+        g_bridge.list->BeginEvent(1, kNgxMark, sizeof(kNgxMark));
         re = SafeEvaluateGuarded(g_bridge.eval_feature, g_bridge.list,
                                  g_bridge.feature, g_bridge.params, &code);
-    g_bridge.list->EndEvent();
+        g_bridge.list->EndEvent();
+    }
 
-    Barrier(g_bridge.list, g_bridge.tex12[SLOT_COLOR],
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-    Barrier(g_bridge.list, g_bridge.tex12[SLOT_DEPTH],
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-    Barrier(g_bridge.list, g_bridge.tex12[SLOT_MV],
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-    Barrier(g_bridge.list, g_bridge.tex12[SLOT_OUTPUT],
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+    if (mode != 1)
+    {
+        Barrier(g_bridge.list, g_bridge.tex12[SLOT_COLOR],
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        Barrier(g_bridge.list, g_bridge.tex12[SLOT_DEPTH],
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        Barrier(g_bridge.list, g_bridge.tex12[SLOT_MV],
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        Barrier(g_bridge.list, g_bridge.tex12[SLOT_OUTPUT],
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+    }
 
     const UINT64 v_out = EndCommands();
 

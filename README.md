@@ -72,7 +72,7 @@ trigger a rebuild automatically.
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `stage` | 3 | How much of the bridge runs. `0` fully inert, `1` the input copies only, `2` also the depth conversion, `3` everything. Useful for isolating a problem: if `stage=0` still misbehaves, the bridge is not the cause. |
-| `mode` | 2 | `0` never writes to the game, `1` transport only with no DLSS, `2` the full path. |
+| `mode` | 2 | `0` never writes to the game, `1` transport-only isolation (shared D3D11 copies plus an empty D3D12 submission; no NGX feature, barriers, or evaluate), `2` the full path. |
 | `skip_game` | 1 | Do not forward the game's own DLSS evaluate. Its result is overwritten anyway, so running it is wasted work. Suppressed only while the bridge is healthy and already delivering. |
 | `flags` | 107 | `DLSS.Feature.Create.Flags` for the bridge's feature. |
 | `subrects` | 1 | Fallback for `DLSS.Enable.Output.Subrects`, used only when the game does not set one of its own. |
