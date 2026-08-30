@@ -27,6 +27,11 @@ static NVSDK_NGX_Result SafeEvaluateGuarded(PFN_D3D12EvaluateFeature fn,
 //   dred=1         ask D3D12 to record what the GPU was executing, so a reset
 //                  can be explained. Read once, when the session opens, so a
 //                  change takes effect on the next launch
+//   adapter=0      which adapter argument D3D12CreateDevice receives:
+//                    0 game adapter only (upstream behaviour)
+//                    1 nullptr, asking Windows for the default adapter
+//                    2 game adapter, then default adapter after a caught fault
+//                  Read when the D3D12 session opens.
 //   flags=-1       DLSS.Feature.Create.Flags. -1 copies whatever the game
 //                  asked for, which is the only value guaranteed to describe
 //                  the game's own buffers. Any other value forces that value:
@@ -96,9 +101,10 @@ struct BridgeCfg
     int dred;
     int skip_exe;
     int unwrap;
+    int adapter;
 };
 
-static BridgeCfg g_cfg = { 2, -1, 1, 0, 0, 3, 1, 1, 1, 1 };
+static BridgeCfg g_cfg = { 2, -1, 1, 0, 0, 3, 1, 1, 1, 1, 0 };
 
 // Accumulates the two figures and reports them together, because either one
 // alone is misleading.
@@ -241,6 +247,7 @@ static void CfgReload()
         else if (_stricmp(key, "dred")        == 0) next.dred        = val;
         else if (_stricmp(key, "skip_exe")    == 0) next.skip_exe    = val;
         else if (_stricmp(key, "unwrap")      == 0) next.unwrap      = val;
+        else if (_stricmp(key, "adapter")     == 0) next.adapter     = val;
         else if (_stricmp(key, "subrects")    == 0) next.subrects    = val;
         else if (_stricmp(key, "reset_every") == 0) next.reset_every = val;
         else if (_stricmp(key, "pixels")      == 0) next.pixels      = val;
@@ -251,18 +258,21 @@ static void CfgReload()
     if (next.stage < 0 || next.stage > 3) next.stage = g_cfg.stage;
 
     if (next.mode < 0 || next.mode > 2) next.mode = g_cfg.mode;
+    if (next.adapter < 0 || next.adapter > 2) next.adapter = g_cfg.adapter;
 
     const bool rebuild = (next.flags != g_cfg.flags) || (next.subrects != g_cfg.subrects);
     const bool changed = rebuild || (next.mode != g_cfg.mode) ||
                          (next.reset_every != g_cfg.reset_every) || (next.pixels != g_cfg.pixels) ||
-                         (next.stage != g_cfg.stage) || (next.skip_game != g_cfg.skip_game);
+                         (next.stage != g_cfg.stage) || (next.skip_game != g_cfg.skip_game) ||
+                         (next.dred != g_cfg.dred) || (next.skip_exe != g_cfg.skip_exe) ||
+                         (next.unwrap != g_cfg.unwrap) || (next.adapter != g_cfg.adapter);
     if (!changed) return;
 
     g_cfg = next;
     Log("[bridge] config: stage=%d mode=%d flags=%d subrects=%d reset_every=%d pixels=%d "
-        "skip_game=%d dred=%d skip_exe=%d unwrap=%d",
+        "skip_game=%d dred=%d skip_exe=%d unwrap=%d adapter=%d",
         g_cfg.stage, g_cfg.mode, g_cfg.flags, g_cfg.subrects, g_cfg.reset_every, g_cfg.pixels,
-        g_cfg.skip_game, g_cfg.dred, g_cfg.skip_exe, g_cfg.unwrap);
+        g_cfg.skip_game, g_cfg.dred, g_cfg.skip_exe, g_cfg.unwrap, g_cfg.adapter);
 
     // Creation-time values only take effect on a new feature, so invalidate the
     // current one and let the next frame build it again.
@@ -277,9 +287,10 @@ static void CfgWriteDefault()
 
     FILE *f = nullptr;
     if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
-    fprintf(f, "stage=%d\nmode=%d\nskip_game=%d\nflags=%d\nsubrects=%d\nreset_every=%d\npixels=%d\ndred=%d\nskip_exe=%d\nunwrap=%d\n",
+    fprintf(f, "stage=%d\nmode=%d\nskip_game=%d\nflags=%d\nsubrects=%d\nreset_every=%d\npixels=%d\ndred=%d\nskip_exe=%d\nunwrap=%d\nadapter=%d\n",
             g_cfg.stage, g_cfg.mode, g_cfg.skip_game, g_cfg.flags, g_cfg.subrects,
-            g_cfg.reset_every, g_cfg.pixels, g_cfg.dred, g_cfg.skip_exe, g_cfg.unwrap);
+            g_cfg.reset_every, g_cfg.pixels, g_cfg.dred, g_cfg.skip_exe, g_cfg.unwrap,
+            g_cfg.adapter);
     fclose(f);
     Log("[bridge] wrote default config to %s", path);
 }
@@ -399,12 +410,41 @@ static HRESULT SafeCreateDevice(PFN_D3D12CreateDevice_ fn, IDXGIAdapter *ad,
 {
     *code = 0;
     HRESULT hr = E_FAIL;
-    __try { hr = fn(ad, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
+    IUnknown *first = g_cfg.adapter == 1 ? nullptr : ad;
+    Log("[bridge] D3D12CreateDevice adapter strategy %d: first argument %s",
+        g_cfg.adapter, first == nullptr ? "nullptr (Windows default)" : "game adapter");
+    __try { hr = fn(first, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
                     reinterpret_cast<void **>(out)); }
     __except (CaptureFault(GetExceptionInformation()))
-    { *code = GetExceptionCode(); return E_FAIL; }
+    { *code = GetExceptionCode(); }
 
-    if (SUCCEEDED(hr) && *out != nullptr && g_cfg.unwrap != 0) UnwrapReShadeProxy(out);
+    // FFXV's D3D11 device can yield an adapter object that D3D12Core rejects
+    // before returning an HRESULT. The null-adapter form asks Windows to select
+    // the default hardware adapter and is equivalent on this single-NVIDIA-GPU
+    // system. Retry only after a caught exception, never after an ordinary API
+    // failure, so the upstream behavior remains unchanged for other cases.
+    if (*code != 0 && g_cfg.adapter == 2 && first != nullptr)
+    {
+        Log("[bridge] D3D12CreateDevice faulted with the game's adapter; retrying "
+            "once with the default adapter.");
+        *out = nullptr;
+        *code = 0;
+        __try { hr = fn(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
+                        reinterpret_cast<void **>(out)); }
+        __except (CaptureFault(GetExceptionInformation()))
+        { *code = GetExceptionCode(); return E_FAIL; }
+    }
+
+    if (*code != 0) return E_FAIL;
+
+    if (SUCCEEDED(hr) && *out != nullptr)
+    {
+        const LUID selected = (*out)->GetAdapterLuid();
+        Log("[bridge] D3D12 device adapter LUID %08lX:%08lX",
+            static_cast<unsigned long>(selected.HighPart),
+            static_cast<unsigned long>(selected.LowPart));
+        if (g_cfg.unwrap != 0) UnwrapReShadeProxy(out);
+    }
     return hr;
 }
 

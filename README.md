@@ -78,6 +78,18 @@ trigger a rebuild automatically.
 | `subrects` | 1 | Fallback for `DLSS.Enable.Output.Subrects`, used only when the game does not set one of its own. |
 | `reset_every` | 0 | `1` forces the NGX Reset flag every frame, discarding temporal history. Diagnostic only. |
 | `pixels` | 0 | `1` reads pixels back to the CPU for debugging. Stalls the GPU hard. |
+| `adapter` | 0 | Experimental device selection: `0` uses the game adapter (upstream), `1` asks Windows for the default adapter, and `2` retries with the default adapter only after a caught game-adapter fault. Takes effect when a new D3D12 session opens. |
+
+### Final Fantasy XV diagnostic build
+
+Final Fantasy XV can raise `0xC0000005` inside `D3D12Core.dll` while creating
+the private D3D12 device with its D3D11-derived adapter. This fork adds the
+opt-in `adapter` strategies above. Start with `stage=0`, `dred=0`, and
+`adapter=1`; after confirming normal rendering, use `stage=3` on a fresh
+launch. The exception guard and normal-rendering fallback remain intact.
+
+This repository contains bridge source only. It does not distribute NVIDIA
+NGX or Neural Rendering binaries.
 
 ## Log
 

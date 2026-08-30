@@ -1,0 +1,42 @@
+name: Build experimental bridge
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ffxv-adapter-fallback
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build with MSVC and the Windows SDK
+        shell: cmd
+        working-directory: src
+        run: |
+          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
+          rc /nologo version.rc
+          cl /nologo /LD /EHsc /O2 /MT /W4 dlss5-dx11-bridge.cpp /link /OUT:dlss5-dx11-bridge.addon64 version.res kernel32.lib user32.lib advapi32.lib /DYNAMICBASE /NXCOMPAT
+
+      - name: Record checksum
+        shell: pwsh
+        run: Get-FileHash -Algorithm SHA256 src/dlss5-dx11-bridge.addon64 | Format-List | Out-File -Encoding ascii src/dlss5-dx11-bridge.addon64.sha256.txt
+
+      - name: Upload unsigned test build
+        uses: actions/upload-artifact@v4
+        with:
+          name: dlss5-dx11-bridge-ffxv-test
+          path: |
+            src/dlss5-dx11-bridge.addon64
+            src/dlss5-dx11-bridge.addon64.sha256.txt
+          if-no-files-found: error
+          retention-days: 7
