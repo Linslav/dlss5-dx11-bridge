@@ -41,6 +41,10 @@ static NVSDK_NGX_Result SafeEvaluateGuarded(PFN_D3D12EvaluateFeature fn,
 //                  timeout, instead of placing an uncancellable wait on the
 //                  game's D3D11 queue. Diagnostic only: slower, but a stalled
 //                  private queue cannot permanently black-screen the game.
+//   share=0        D3D11 fallback texture flags: 0 preserves upstream's
+//                  SHARED_NTHANDLE|SHARED combination, 1 uses NTHANDLE alone
+//                  with the bridge's shared fences, and 2 uses Microsoft's
+//                  documented NTHANDLE|SHARED_KEYEDMUTEX combination.
 //   flags=-1       DLSS.Feature.Create.Flags. -1 copies whatever the game
 //                  asked for, which is the only value guaranteed to describe
 //                  the game's own buffers. Any other value forces that value:
@@ -113,9 +117,10 @@ struct BridgeCfg
     int adapter;
     int d3d12_hook;
     int sync;
+    int share;
 };
 
-static BridgeCfg g_cfg = { 2, -1, 1, 0, 0, 3, 1, 1, 1, 1, 0, 0, 0 };
+static BridgeCfg g_cfg = { 2, -1, 1, 0, 0, 3, 1, 1, 1, 1, 0, 0, 0, 0 };
 
 // Accumulates the two figures and reports them together, because either one
 // alone is misleading.
@@ -261,6 +266,7 @@ static void CfgReload()
         else if (_stricmp(key, "adapter")     == 0) next.adapter     = val;
         else if (_stricmp(key, "d3d12_hook")  == 0) next.d3d12_hook = val;
         else if (_stricmp(key, "sync")        == 0) next.sync        = val;
+        else if (_stricmp(key, "share")       == 0) next.share       = val;
         else if (_stricmp(key, "subrects")    == 0) next.subrects    = val;
         else if (_stricmp(key, "reset_every") == 0) next.reset_every = val;
         else if (_stricmp(key, "pixels")      == 0) next.pixels      = val;
@@ -274,13 +280,15 @@ static void CfgReload()
     if (next.adapter < 0 || next.adapter > 2) next.adapter = g_cfg.adapter;
     if (next.d3d12_hook < 0 || next.d3d12_hook > 1) next.d3d12_hook = g_cfg.d3d12_hook;
     if (next.sync < 0 || next.sync > 1) next.sync = g_cfg.sync;
+    if (next.share < 0 || next.share > 2) next.share = g_cfg.share;
 
     // mode=1 intentionally owns no NGX feature, while modes 0 and 2 do. A live
     // transition in either direction therefore needs a resource/feature rebuild
     // rather than reusing frame_ready with a null or stale feature handle.
     const bool rebuild = (next.flags != g_cfg.flags) ||
                          (next.subrects != g_cfg.subrects) ||
-                         (next.mode != g_cfg.mode);
+                         (next.mode != g_cfg.mode) ||
+                         (next.share != g_cfg.share);
     const bool changed = rebuild || (next.mode != g_cfg.mode) ||
                          (next.reset_every != g_cfg.reset_every) || (next.pixels != g_cfg.pixels) ||
                          (next.stage != g_cfg.stage) || (next.skip_game != g_cfg.skip_game) ||
@@ -292,10 +300,10 @@ static void CfgReload()
 
     g_cfg = next;
     Log("[bridge] config: stage=%d mode=%d flags=%d subrects=%d reset_every=%d pixels=%d "
-        "skip_game=%d dred=%d skip_exe=%d unwrap=%d adapter=%d d3d12_hook=%d sync=%d",
+        "skip_game=%d dred=%d skip_exe=%d unwrap=%d adapter=%d d3d12_hook=%d sync=%d share=%d",
         g_cfg.stage, g_cfg.mode, g_cfg.flags, g_cfg.subrects, g_cfg.reset_every, g_cfg.pixels,
         g_cfg.skip_game, g_cfg.dred, g_cfg.skip_exe, g_cfg.unwrap, g_cfg.adapter,
-        g_cfg.d3d12_hook, g_cfg.sync);
+        g_cfg.d3d12_hook, g_cfg.sync, g_cfg.share);
 
     // Creation-time values only take effect on a new feature, so invalidate the
     // current one and let the next frame build it again.
@@ -310,10 +318,10 @@ static void CfgWriteDefault()
 
     FILE *f = nullptr;
     if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
-    fprintf(f, "stage=%d\nmode=%d\nskip_game=%d\nflags=%d\nsubrects=%d\nreset_every=%d\npixels=%d\ndred=%d\nskip_exe=%d\nunwrap=%d\nadapter=%d\nd3d12_hook=%d\nsync=%d\n",
+    fprintf(f, "stage=%d\nmode=%d\nskip_game=%d\nflags=%d\nsubrects=%d\nreset_every=%d\npixels=%d\ndred=%d\nskip_exe=%d\nunwrap=%d\nadapter=%d\nd3d12_hook=%d\nsync=%d\nshare=%d\n",
             g_cfg.stage, g_cfg.mode, g_cfg.skip_game, g_cfg.flags, g_cfg.subrects,
             g_cfg.reset_every, g_cfg.pixels, g_cfg.dred, g_cfg.skip_exe, g_cfg.unwrap,
-            g_cfg.adapter, g_cfg.d3d12_hook, g_cfg.sync);
+            g_cfg.adapter, g_cfg.d3d12_hook, g_cfg.sync, g_cfg.share);
     fclose(f);
     Log("[bridge] wrote default config to %s", path);
 }
@@ -1530,15 +1538,22 @@ static bool MakeSharedPair(ID3D11Device *dev11, ID3D11Device1 *dev1, int i,
                           (uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
                                : D3D12_RESOURCE_FLAG_NONE);
 
+    const char *step = "CreateCommittedResource";
     HRESULT hr = g_bridge.dev12->CreateCommittedResource(
         &hp, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr,
         __uuidof(ID3D12Resource), reinterpret_cast<void **>(&g_bridge.tex12[i]));
     if (SUCCEEDED(hr))
+    {
+        step = "CreateSharedHandle";
         hr = g_bridge.dev12->CreateSharedHandle(g_bridge.tex12[i], nullptr, GENERIC_ALL,
                                                 nullptr, &g_bridge.shared[i]);
+    }
     if (SUCCEEDED(hr))
+    {
+        step = "OpenSharedResource1";
         hr = dev1->OpenSharedResource1(g_bridge.shared[i], __uuidof(ID3D11Texture2D),
                                        reinterpret_cast<void **>(&g_bridge.tex11[i]));
+    }
     if (SUCCEEDED(hr))
     {
     {
@@ -1551,8 +1566,8 @@ static bool MakeSharedPair(ID3D11Device *dev11, ID3D11Device1 *dev1, int i,
             static_cast<void *>(g_bridge.tex11[i]));
         return true;
     }
-    Log("[bridge] %s: D3D12->D3D11 path failed 0x%08X, trying the other direction",
-        kSlotName[i], hr);
+    Log("[bridge] %s: D3D12->D3D11 %s failed 0x%08X, trying the other direction",
+        kSlotName[i], step, hr);
 
     if (g_bridge.tex11[i]  != nullptr) { g_bridge.tex11[i]->Release();  g_bridge.tex11[i]  = nullptr; }
     if (g_bridge.tex12[i]  != nullptr) { g_bridge.tex12[i]->Release();  g_bridge.tex12[i]  = nullptr; }
@@ -1569,7 +1584,16 @@ static bool MakeSharedPair(ID3D11Device *dev11, ID3D11Device1 *dev1, int i,
     td.Usage            = D3D11_USAGE_DEFAULT;
     td.BindFlags        = D3D11_BIND_SHADER_RESOURCE |
                           (uav ? D3D11_BIND_UNORDERED_ACCESS : 0);
-    td.MiscFlags        = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
+    if (g_cfg.share == 1)
+        td.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+    else if (g_cfg.share == 2)
+        td.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE |
+                       D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+    else
+        td.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE |
+                       D3D11_RESOURCE_MISC_SHARED;
+    Log("[bridge] %s: D3D11 fallback share strategy %d, MiscFlags=0x%X",
+        kSlotName[i], g_cfg.share, td.MiscFlags);
 
     hr = dev11->CreateTexture2D(&td, nullptr, &g_bridge.tex11[i]);
     if (FAILED(hr))

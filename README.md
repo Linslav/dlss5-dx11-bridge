@@ -81,6 +81,7 @@ trigger a rebuild automatically.
 | `adapter` | 0 | Experimental device selection: `0` uses the game adapter (upstream), `1` asks Windows for the default adapter, and `2` retries with the default adapter only after a caught game-adapter fault. Takes effect when a new D3D12 session opens. |
 | `d3d12_hook` | 0 | Diagnostic only. `1` bypasses a verified five-byte `D3D12CreateDevice` entry detour for the guarded device-creation call, then restores it immediately. Any unexpected byte pattern fails closed and leaves the hook in place. |
 | `sync` | 0 | Diagnostic only. `1` waits on the CPU for each D3D12 output fence with a two-second timeout instead of adding an uncancellable wait to the game's D3D11 queue. It is slower, but a stalled private queue cannot permanently black-screen the game. |
+| `share` | 0 | Diagnostic D3D11-fallback flags: `0` preserves upstream `SHARED_NTHANDLE | SHARED`, `1` uses `SHARED_NTHANDLE` alone with shared fences, and `2` uses the documented `SHARED_NTHANDLE | SHARED_KEYEDMUTEX`. |
 
 The bridge uses separate one-direction shared fences for input and output. This
 avoids alternating D3D11 and D3D12 signal operations on the same fence, which
