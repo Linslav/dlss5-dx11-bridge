@@ -7,7 +7,8 @@ static NVSDK_NGX_Result SafeEvaluateGuarded(PFN_D3D12EvaluateFeature fn,
 {
     *code = 0;
     __try { return fn(list, feature, p, nullptr); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return NGX_EXCEPTION_MARKER; }
+    __except (CaptureFault(GetExceptionInformation()))
+    { *code = GetExceptionCode(); return NGX_EXCEPTION_MARKER; }
 }
 
 // Everything worth trying here is a value, not code, and the add-on binary is
@@ -94,12 +95,28 @@ struct BridgeCfg
     int skip_game;
     int dred;
     int skip_exe;
+    int unwrap;
 };
 
-static BridgeCfg g_cfg = { 2, -1, 1, 0, 0, 3, 1, 1, 1 };
+static BridgeCfg g_cfg = { 2, -1, 1, 0, 0, 3, 1, 1, 1, 1 };
 
 // Accumulates the two figures and reports them together, because either one
 // alone is misleading.
+// Whether this process owns the foreground window, asked once per report rather
+// than per frame. An out-of-focus window has now been read as a performance
+// finding three separate times in one day of log analysis: the game throttles,
+// the bridge's share of a frame moves, and the number looks like a regression
+// that is not there. A figure that cannot be read in isolation should not be
+// printed as though it can.
+static bool ForegroundIsThisProcess()
+{
+    HWND fg = GetForegroundWindow();
+    if (fg == nullptr) return false;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(fg, &pid);
+    return pid == GetCurrentProcessId();
+}
+
 static void TimingTick(LONGLONG entry, LONGLONG exit)
 {
     if (g_bridge.qpf == 0)
@@ -150,10 +167,11 @@ static void TimingTick(LONGLONG entry, LONGLONG exit)
     const double hi = 1000.0 * double(g_bridge.iv_max) / double(g_bridge.qpf);
 
     Log("[bridge] %.0f frames: bridge CPU %.2f ms/frame | frame interval %.2f ms (%.1f fps) "
-        "| spread %.2f-%.2f ms | bridge is %.0f%% of the frame | d3d12 %llu/%llu (%lld behind)",
+        "| spread %.2f-%.2f ms | bridge is %.0f%% of the frame | d3d12 %llu/%llu (%lld behind)%s",
         n, cpu_ms / n, span_ms / n, 1000.0 / (span_ms / n), lo, hi,
         100.0 * cpu_ms / span_ms, done, g_bridge.fence_value,
-        static_cast<long long>(g_bridge.fence_value) - static_cast<long long>(done));
+        static_cast<long long>(g_bridge.fence_value) - static_cast<long long>(done),
+        ForegroundIsThisProcess() ? "" : "  <== WINDOW NOT IN FOCUS, do not read as steady state");
 
     // This measures the gap between the game's own DLSS calls, so a loading
     // screen, an alt-tab or a paused game all land here as one enormous frame --
@@ -222,6 +240,7 @@ static void CfgReload()
         else if (_stricmp(key, "flags")       == 0) next.flags       = val;
         else if (_stricmp(key, "dred")        == 0) next.dred        = val;
         else if (_stricmp(key, "skip_exe")    == 0) next.skip_exe    = val;
+        else if (_stricmp(key, "unwrap")      == 0) next.unwrap      = val;
         else if (_stricmp(key, "subrects")    == 0) next.subrects    = val;
         else if (_stricmp(key, "reset_every") == 0) next.reset_every = val;
         else if (_stricmp(key, "pixels")      == 0) next.pixels      = val;
@@ -241,9 +260,9 @@ static void CfgReload()
 
     g_cfg = next;
     Log("[bridge] config: stage=%d mode=%d flags=%d subrects=%d reset_every=%d pixels=%d "
-        "skip_game=%d dred=%d skip_exe=%d",
+        "skip_game=%d dred=%d skip_exe=%d unwrap=%d",
         g_cfg.stage, g_cfg.mode, g_cfg.flags, g_cfg.subrects, g_cfg.reset_every, g_cfg.pixels,
-        g_cfg.skip_game, g_cfg.dred, g_cfg.skip_exe);
+        g_cfg.skip_game, g_cfg.dred, g_cfg.skip_exe, g_cfg.unwrap);
 
     // Creation-time values only take effect on a new feature, so invalidate the
     // current one and let the next frame build it again.
@@ -258,9 +277,9 @@ static void CfgWriteDefault()
 
     FILE *f = nullptr;
     if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
-    fprintf(f, "stage=%d\nmode=%d\nskip_game=%d\nflags=%d\nsubrects=%d\nreset_every=%d\npixels=%d\ndred=%d\nskip_exe=%d\n",
+    fprintf(f, "stage=%d\nmode=%d\nskip_game=%d\nflags=%d\nsubrects=%d\nreset_every=%d\npixels=%d\ndred=%d\nskip_exe=%d\nunwrap=%d\n",
             g_cfg.stage, g_cfg.mode, g_cfg.skip_game, g_cfg.flags, g_cfg.subrects,
-            g_cfg.reset_every, g_cfg.pixels, g_cfg.dred, g_cfg.skip_exe);
+            g_cfg.reset_every, g_cfg.pixels, g_cfg.dred, g_cfg.skip_exe, g_cfg.unwrap);
     fclose(f);
     Log("[bridge] wrote default config to %s", path);
 }
@@ -303,6 +322,8 @@ static void LogCenterPixel(ID3D11DeviceContext *ctx, ID3D11Device *dev11,
 // Every path that gives up goes through here, so the user is told once, in the
 // overlay, that the bridge stopped -- otherwise there is simply no effect on
 // screen and nothing to explain it without opening a file.
+static void BridgeReleaseExposureFwd();
+
 static void BridgeReleaseTextures();
 
 // It is also the only shutdown this add-on has. It used to set a flag and
@@ -332,14 +353,59 @@ static void LogVideoMemory(const char *when)
 // DXGI_ERROR_DEVICE_HUNG about twenty seconds in, and nothing else about it is
 // known. This must be switched on before the device exists, so it is done here
 // rather than where the removal is noticed.
-// Prey 2017 faults inside D3D12Core.dll here, which no HRESULT reports.
+// ReShade wraps every D3D12 device created through the export, this add-on's
+// own included, and then broadcasts init_pipeline, init_sampler and the rest to
+// every loaded add-on for everything built from that device. There is no filter
+// saying which add-on asked for it.
+//
+// Luma is a DX11-only framework. Its OnInitDevice is the one handler that does
+// return early for a non-D3D11 device, so ReShade never gives it per-device
+// data -- and every other handler then dereferences that null. Prey 2017 does
+// not opt into the compile-time API guard that would have stopped the rest, so
+// NVSDK_NGX_D3D12_Init_Ext creating pipeline state on this device faulted at an
+// address inside Luma-Prey.addon.
+//
+// IID_UnwrappedObject is ReShade's own way out of its proxy, from its
+// com_utils.hpp; the D3D12 proxy answers it by AddRef-ing and returning the
+// real device. RenoDX asks the same question of every command list before
+// forwarding it to NGX, so a native pointer is the case NGX callers prefer.
+//
+// The proxy is deliberately not released. Nothing releases this device for the
+// life of the process, and releasing it would announce destroy_device to those
+// same add-ons for a device still in use.
+static void UnwrapReShadeProxy(ID3D12Device **dev)
+{
+    static const GUID kUnwrapped =
+        { 0x7f2c9a11, 0x3b4e, 0x4d6a, { 0x81, 0x2f, 0x5e, 0x9c, 0xd3, 0x7a, 0x1b, 0x42 } };
+
+    ID3D12Device *raw = nullptr;
+    if (FAILED((*dev)->QueryInterface(kUnwrapped, reinterpret_cast<void **>(&raw))) ||
+        raw == nullptr)
+    {
+        Log("[bridge] the D3D12 device is not wrapped; nothing to unwrap. On ReShade "
+            "older than 6.6 this is expected and the session runs as before.");
+        return;
+    }
+    Log("[bridge] the D3D12 device came back wrapped by ReShade: %p over %p. NGX is "
+        "given the unwrapped one, so no other add-on is handed D3D12 objects it "
+        "never asked for.", static_cast<void *>(*dev), static_cast<void *>(raw));
+    *dev = raw;
+}
+
+// The fault here was reported inside D3D12Core.dll on an older release; device
+// creation now succeeds and what follows is where Prey stops.
 static HRESULT SafeCreateDevice(PFN_D3D12CreateDevice_ fn, IDXGIAdapter *ad,
                                 ID3D12Device **out, DWORD *code)
 {
     *code = 0;
-    __try { return fn(ad, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
-                      reinterpret_cast<void **>(out)); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return E_FAIL; }
+    HRESULT hr = E_FAIL;
+    __try { hr = fn(ad, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
+                    reinterpret_cast<void **>(out)); }
+    __except (CaptureFault(GetExceptionInformation()))
+    { *code = GetExceptionCode(); return E_FAIL; }
+
+    if (SUCCEEDED(hr) && *out != nullptr && g_cfg.unwrap != 0) UnwrapReShadeProxy(out);
+    return hr;
 }
 
 static bool EnableDredGuarded(HMODULE d3d12, DWORD *code)
@@ -798,6 +864,11 @@ static void BridgeReleaseTextures()
 {
     BridgeDrainGpu();
 
+    // The exposure mirror goes with the rest. Leaving it out kept a shared NT
+    // handle and a D3D12 resource alive for the life of the process on a
+    // session that had already told the user it was disabled.
+    BridgeReleaseExposureFwd();
+
     if (g_bridge.depth_uav != nullptr) { g_bridge.depth_uav->Release(); g_bridge.depth_uav = nullptr; }
     if (g_bridge.depth_srv != nullptr) { g_bridge.depth_srv->Release(); g_bridge.depth_srv = nullptr; }
     if (g_bridge.depth_src != nullptr) { g_bridge.depth_src->Release(); g_bridge.depth_src = nullptr; }
@@ -910,11 +981,27 @@ static bool BridgeInitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
     {
         DWORD dcode = 0;
         HRESULT hr = SafeCreateDevice(create_device, adapter, &g_bridge.dev12, &dcode);
+        // A retry lived here that announced "turning DRED off and trying once
+        // more" and then called the identical function under the identical
+        // process-global setting: D3D12_DRED_ENABLEMENT_DISABLED is written
+        // nowhere in this add-on. Had the second attempt happened to succeed it
+        // would have reported DRED as the cause of a configuration that never
+        // existed. dred=0 is the only thing that produces a DRED-off attempt.
         if (dcode != 0)
         {
+            {
+                wchar_t owner[MAX_PATH] = {};
+                if (NameFaultOwner(owner, MAX_PATH))
+                    Log("[bridge]   the fault was at %p, inside %ls",
+                        g_last_fault_at, owner);
+            }
             Log("[bridge] D3D12CreateDevice raised 0x%08X inside the D3D12 runtime. "
                 "Nothing this add-on can do about that, so it stops here and the "
-                "game keeps its own rendering.", dcode);
+                "game keeps its own rendering.%s", dcode,
+                g_cfg.dred != 0
+                    ? " DRED was requested for this session; set dred=0 in "
+                      "dlss5-dx11-bridge.cfg to make an attempt without it."
+                    : " DRED was off for this attempt.");
             goto fail;
         }
         if (FAILED(hr) || g_bridge.dev12 == nullptr)
@@ -942,9 +1029,31 @@ static bool BridgeInitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
             g_bridge.create_feature == nullptr || g_bridge.eval_feature == nullptr)
         { Log("[bridge] required NGX exports missing"); goto fail; }
 
+        // NGX is told where the application data lives. This was the add-on's own
+        // folder unconditionally, which is the game's folder in every title reported
+        // so far -- but ReShade can load add-ons from elsewhere, and Phantasy Star
+        // Online 2 is the first report where it does. There the NGX snippets sit
+        // beside the executable, and that session came up with every capability
+        // reading zero on an RTX 5080, which that card does not otherwise do.
+        //
+        // Whether the data path causes that is not established. What is established
+        // is that pointing NGX at a folder holding none of its files was never
+        // intended, so the executable's folder wins when the two differ, and both
+        // are logged so a report can settle it.
         wchar_t data_path[MAX_PATH] = {};
-        GetModuleFileNameW(g_self, data_path, MAX_PATH);
-        if (wchar_t *s = wcsrchr(data_path, L'\\')) *(s + 1) = L'\0';
+        wchar_t self_dir[MAX_PATH] = {};
+        GetModuleFileNameW(g_self, self_dir, MAX_PATH);
+        if (wchar_t *sd = wcsrchr(self_dir, (wchar_t)92)) *(sd + 1) = 0;
+
+        wchar_t exe_dir[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exe_dir, MAX_PATH);
+        if (wchar_t *ed = wcsrchr(exe_dir, (wchar_t)92)) *(ed + 1) = 0;
+
+        wcscpy_s(data_path, _wcsicmp(self_dir, exe_dir) == 0 ? self_dir : exe_dir);
+        Log("[bridge] NGX data path: %ls", data_path);
+        if (_wcsicmp(self_dir, exe_dir) != 0)
+            Log("[bridge]   the add-on itself is in %ls. The game's folder is used "
+                "because that is where the NGX snippets are.", self_dir);
 
         // The SDK version constant is not documented and has moved between NGX
         // releases, so it is negotiated rather than assumed. Hardcoding the one
@@ -953,6 +1062,11 @@ static bool BridgeInitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
         // some drivers accept one entry point and fault on the other.
         auto init_project = reinterpret_cast<PFN_Init_ProjectID>(
             GetProcAddress(ngx, "NVSDK_NGX_D3D12_Init_ProjectID"));
+
+        // Nothing may patch a module between here and the end of the init: NGX
+        // loads its own snippets inside these calls, and the loader notification
+        // that fires for them arrives on this very thread.
+        g_ngx_init_in_flight = true;
 
         Breadcrumb("initialising NGX on D3D12");
         DWORD code    = 0;
@@ -973,7 +1087,14 @@ static bool BridgeInitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
                                                  g_bridge.dev12, ver, &code);
                 if (code != 0)
                 {
-                    Log("[bridge] Init_Ext(version=0x%02X) raised 0x%08X", ver, code);
+                    {
+                        wchar_t owner[MAX_PATH] = {};
+                        if (NameFaultOwner(owner, MAX_PATH))
+                            Log("[bridge] Init_Ext(version=0x%02X) raised 0x%08X at %p, inside %ls",
+                                ver, code, g_last_fault_at, owner);
+                        else
+                            Log("[bridge] Init_Ext(version=0x%02X) raised 0x%08X", ver, code);
+                    }
                     faulted = true;
                 }
                 else
@@ -990,7 +1111,14 @@ static bool BridgeInitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
                                                        data_path, g_bridge.dev12, ver, &code);
                 if (code != 0)
                 {
-                    Log("[bridge] Init_ProjectID(version=0x%02X) raised 0x%08X", ver, code);
+                    {
+                        wchar_t owner[MAX_PATH] = {};
+                        if (NameFaultOwner(owner, MAX_PATH))
+                            Log("[bridge] Init_ProjectID(version=0x%02X) raised 0x%08X at %p, inside %ls",
+                                ver, code, g_last_fault_at, owner);
+                        else
+                            Log("[bridge] Init_ProjectID(version=0x%02X) raised 0x%08X", ver, code);
+                    }
                     faulted = true;
                 }
                 else
@@ -1000,6 +1128,18 @@ static bool BridgeInitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
                     if (r == NGX_SUCCESS) inited = true;
                 }
             }
+        }
+        g_ngx_init_in_flight = false;
+
+        if (faulted && g_ngx_proxy[0] != 0)
+        {
+            Log("[bridge] %ls exports the NGX entry points as well and is not the "
+                "driver's loader, so an NGX proxy is running in this process. Such a "
+                "proxy patches code inside the driver's NGX module and opens its own "
+                "session on it before this one. Prey 2017 with OptiScaler installed as "
+                "WINMM.dll is the reported case, and it is the difference from titles "
+                "where this same driver and module initialise. Removing the proxy is "
+                "the test that would settle it.", g_ngx_proxy);
         }
         if (faulted)
         {
@@ -1092,6 +1232,21 @@ static bool BridgeInitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
         Log("############# bridge: session open #############");
         Log("");
         if (adapter != nullptr) adapter->Release();
+        // The queue, the list and the event were created without checking any
+        // of them, and every one is dereferenced on the acting path: the queue
+        // in ExecuteCommandLists on the very first frame, the list in Reset, and
+        // a null event is worse than a crash -- SetEventOnCompletion on a null
+        // handle blocks the render thread with no timeout. The teardown path
+        // already null-checks exactly these three; the guard existed where
+        // nothing acts and was missing where everything does.
+        if (g_bridge.queue == nullptr || g_bridge.list == nullptr ||
+            g_bridge.fence_event == nullptr)
+        {
+            Log("[bridge] the command queue, list or fence event could not be "
+                "created, so the session is not opened.");
+            goto fail;
+        }
+
         g_bridge.session_ready = true;
         return true;
     }
@@ -1505,6 +1660,38 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt,
                       static_cast<unsigned int>(g_cfg.subrects));
     else
         g_bridge.params->Set("DLSS.Enable.Output.Subrects", g_cfg.subrects);
+    // The render preset picks which DLSS model weights run, and the D3D12 feature
+    // was getting NGX's default while the game's own D3D11 feature ran whatever
+    // it asked for -- so the two sides upscaled with different models and the
+    // neural-rendering add-on worked from ours. Prey 2017 reaches DLSS through
+    // Luma, which sets these; so do DLSSTweaks and OptiScaler, and so do plenty
+    // of games directly.
+    //
+    // nvsdk_ngx_helpers.h does not write these keys at all, so unlike MV.Scale
+    // there is no neutral to fall back on: absence means NVSDK_NGX_DLSS_Hint_
+    // Render_Preset_Default, which is what an unset key already gives. Mirror
+    // only what the game set. Key strings are from nvsdk_ngx_defs.h.
+    if (gp != nullptr)
+    {
+        static const char *preset_keys[] = {
+            "DLSS.Hint.Render.Preset.DLAA",
+            "DLSS.Hint.Render.Preset.Quality",
+            "DLSS.Hint.Render.Preset.Balanced",
+            "DLSS.Hint.Render.Preset.Performance",
+            "DLSS.Hint.Render.Preset.UltraPerformance",
+            "DLSS.Hint.Render.Preset.UltraQuality",
+        };
+        for (const char *k : preset_keys)
+        {
+            unsigned int v = 0;
+            if (gp->Get(k, &v) != NGX_SUCCESS) continue;
+            g_bridge.params->Set(k, v);
+            if (!g_bridge.presets_reported)
+                Log("[bridge] %s = %u, copied from the game", k, v);
+        }
+        g_bridge.presets_reported = true;
+    }
+
     g_bridge.params->Set("CreationNodeMask", 1u);
     g_bridge.params->Set("VisibilityNodeMask", 1u);
     g_bridge.params->Set("RTXValue", 0);
@@ -1876,6 +2063,108 @@ static void MirrorFloatParam(const NVSDK_NGX_Parameter *src, const char *key)
     g_bridge.params->Set(key, v);
 }
 
+// Mount & Blade II: Bannerlord creates its feature with flags 59 -- IsHDR,
+// MVLowRes, DepthInverted, DoSharpening -- and no AutoExposure, then supplies a
+// 1x1 ExposureTexture on every evaluate. The bridge copied the flags faithfully
+// and mirrored four textures, so its D3D12 feature ran with auto exposure off
+// and no exposure input at all: DLSS accumulated without knowing the exposure,
+// which is ghosting. Before 1.0.16 the forced flags=107 carried AutoExposure and
+// hid this; copying the game's flags removed that cover.
+//
+// Kept out of the slot array on purpose. Games that supply no exposure texture
+// are the common case and every SLOT_COUNT loop would have to learn about a
+// null.
+static void BridgeReleaseExposure()
+{
+    // NGX does not AddRef the resources in a parameter block -- that is why
+    // games must keep them alive across the call -- and this block is allocated
+    // once per session and never Reset. Freeing the texture without clearing
+    // the key leaves the driver a freed pointer on the very next evaluate.
+    // The drain is this file's own rule: a submitted command list may still
+    // reference the surface, and up to three are in flight.
+    if (g_bridge.exp12 != nullptr)
+    {
+        BridgeDrainGpu();
+        if (g_bridge.params != nullptr)
+            g_bridge.params->Set("ExposureTexture", static_cast<ID3D12Resource *>(nullptr));
+    }
+    if (g_bridge.exp12   != nullptr) { g_bridge.exp12->Release();   g_bridge.exp12   = nullptr; }
+    if (g_bridge.exp11   != nullptr) { g_bridge.exp11->Release();   g_bridge.exp11   = nullptr; }
+    if (g_bridge.exp_shared != nullptr) { CloseHandle(g_bridge.exp_shared); g_bridge.exp_shared = nullptr; }
+    g_bridge.exp_w = g_bridge.exp_h = 0;
+}
+static void BridgeReleaseExposureFwd() { BridgeReleaseExposure(); }
+
+
+// Builds the mirror on first use and whenever the game's exposure texture
+// changes shape. Returns false when it cannot be built, which is not fatal:
+// the frame then runs exactly as it did before, without exposure.
+static bool BridgeEnsureExposure(ID3D11Device *dev11, ID3D11Texture2D *src)
+{
+    D3D11_TEXTURE2D_DESC sd = {};
+    src->GetDesc(&sd);
+
+    if (g_bridge.exp12 != nullptr && g_bridge.exp_w == sd.Width &&
+        g_bridge.exp_h == sd.Height && g_bridge.exp_fmt == sd.Format)
+        return true;
+
+    BridgeReleaseExposure();
+
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width            = sd.Width;
+    td.Height           = sd.Height;
+    td.MipLevels        = 1;
+    td.ArraySize        = 1;
+    // Every other mirror runs the game's format through TypedFormat, and for a
+    // recorded reason: a typeless mirror reaches the D3D12 add-on and it refuses
+    // the surface while this bridge still looks healthy. PSO2 supplies a 1x1
+    // R32_TYPELESS exposure texture, so skipping it here would have left PSO2
+    // with the exact defect this mirror was written to fix.
+    td.Format           = TypedFormat(sd.Format);
+    td.SampleDesc.Count = 1;
+    td.Usage            = D3D11_USAGE_DEFAULT;
+    td.BindFlags        = D3D11_BIND_SHADER_RESOURCE;
+    td.MiscFlags        = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
+
+    HRESULT hr = dev11->CreateTexture2D(&td, nullptr, &g_bridge.exp11);
+    if (SUCCEEDED(hr))
+    {
+        IDXGIResource1 *r = nullptr;
+        hr = g_bridge.exp11->QueryInterface(__uuidof(IDXGIResource1),
+                                            reinterpret_cast<void **>(&r));
+        if (SUCCEEDED(hr))
+        {
+            hr = r->CreateSharedHandle(nullptr,
+                                       DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+                                       nullptr, &g_bridge.exp_shared);
+            r->Release();
+        }
+    }
+    if (SUCCEEDED(hr))
+        hr = g_bridge.dev12->OpenSharedHandle(g_bridge.exp_shared, __uuidof(ID3D12Resource),
+                                              reinterpret_cast<void **>(&g_bridge.exp12));
+    if (FAILED(hr))
+    {
+        Log("[bridge] the exposure texture could not be mirrored 0x%08X. The session "
+            "continues without it, which is what every release before this one did.", hr);
+        BridgeReleaseExposure();
+        return false;
+    }
+
+    g_bridge.exp_w   = sd.Width;
+    g_bridge.exp_h   = sd.Height;
+    g_bridge.exp_fmt = sd.Format;
+    g_bridge.exp12->SetName(L"dlss5-dx11-bridge Exposure");
+    if (!g_bridge.exp_reported)
+    {
+        g_bridge.exp_reported = true;
+        Log("[bridge] the game supplies an exposure texture (%ux%u fmt=%u); it is "
+            "mirrored to D3D12 so both sides run the same contract.",
+            sd.Width, sd.Height, static_cast<unsigned>(sd.Format));
+    }
+    return true;
+}
+
 static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter *gp)
 {
     BridgeRescueStalledQueue();
@@ -1979,8 +2268,37 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
     if (gow == 0 || goh == 0) { gow = d[SLOT_OUTPUT].Width; goh = d[SLOT_OUTPUT].Height; }
 
     // DLSS never produces an image smaller than the one it is given, so an
-    // output size below the render size is not a contract -- it is a mistake in
-    // the block. Gallipoli reports 2560x1440 in and 1485x835 out, which is the
+    // output size below the render size is not a contract: the two pairs have
+    // been written the wrong way round. Four engines do it -- Gallipoli, The
+    // Elder Scrolls Online, Phantasy Star Online 2 and House Party's Unity
+    // plugin -- and the right repair is to swap them back, not to patch one side
+    // from a texture.
+    //
+    // Patching from the texture was what this code did, and it works only while
+    // the allocation happens to equal the display size. Under dynamic resolution
+    // it never does: House Party pads every texture to 5120x2048 while the true
+    // output is 5120x1440 and the true render is a 2970x836 subrect, so the
+    // texture fallback built a feature no evaluate could satisfy and NGX
+    // answered InvalidParameter on every frame of gameplay.
+    if (gow < gw || goh < gh)
+    {
+        static bool said_swap = false;
+        if (!said_swap)
+        {
+            said_swap = true;
+            Log("[bridge] the game reports an input of %ux%u and an output of %ux%u, "
+                "which is the wrong way round: DLSS never returns an image smaller "
+                "than the one it is given.", gw, gh, gow, goh);
+            Log("  Reading them as output and render respectively, the contract is "
+                "%ux%u -> %ux%u.", gow, goh, gw, gh);
+        }
+        const unsigned int tw = gw, th = gh;
+        gw = gow; gh = goh;
+        gow = tw; goh = th;
+    }
+
+    // What follows is the older repair, kept for a block that is inconsistent in
+    // some way the swap above does not resolve. Gallipoli reports 2560x1440 in and 1485x835 out, which is the
     // Balanced render size written into the output fields; NGX answers
     // 0xBAD00005 and the bridge used to rebuild every texture, fail, and repeat
     // until three failures switched it off.
@@ -2001,6 +2319,38 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
         }
         gow = d[SLOT_OUTPUT].Width;
         goh = d[SLOT_OUTPUT].Height;
+    }
+
+    // The same repair the other way round, and it has to come second: fixing the
+    // input first would make the test above compare two already-corrected values
+    // and never fire.
+    //
+    // A render size cannot exceed the texture holding it -- a subrect has to fit
+    // inside its own allocation -- so when it does, the fields have been filled
+    // in the wrong order. The Elder Scrolls Online reports Width=2560x1440 with
+    // a 1485x835 Color texture and a 2560x1440 Output texture, which is
+    // 1485x835 -> 2560x1440 written backwards. Reading it as given built a 1:1
+    // feature at output size and did the upscaling work for nothing.
+    //
+    // Where a game genuinely renders into part of a larger texture the render
+    // size is smaller than the texture, not larger, so that case is untouched:
+    // Final Fantasy XIV renders 2227x1253 inside a 3840x2160 Color texture and
+    // does not come through here.
+    if (gw > d[SLOT_COLOR].Width || gh > d[SLOT_COLOR].Height)
+    {
+        static bool said_in = false;
+        if (!said_in)
+        {
+            said_in = true;
+            Log("[bridge] the game asks for a render of %ux%u from a Color texture of "
+                "%ux%u, which is larger than the texture holding it.", gw, gh,
+                d[SLOT_COLOR].Width, d[SLOT_COLOR].Height);
+            Log("  A subrect has to fit inside its own allocation, so the texture is "
+                "used instead and the contract reads %ux%u -> %ux%u.",
+                d[SLOT_COLOR].Width, d[SLOT_COLOR].Height, gow, goh);
+        }
+        gw = d[SLOT_COLOR].Width;
+        gh = d[SLOT_COLOR].Height;
     }
 
     // If even the texture cannot satisfy it, nothing here can: say so once and
@@ -2148,6 +2498,31 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
     ctx->CopyResource(g_bridge.tex11[SLOT_COLOR], g[SLOT_COLOR]);
     if (g_bridge.mv_converted) BridgeBlitMV(ctx, dev11, g[SLOT_MV]);
 
+    // Mirrored per frame like the rest: it is 1x1 in every report so far, and a
+    // stale exposure is as wrong as none.
+    {
+        ID3D11Resource *ge = nullptr;
+        if (gp->Get("ExposureTexture", &ge) == NGX_SUCCESS && ge != nullptr)
+        {
+            ID3D11Texture2D *gt = nullptr;
+            if (SUCCEEDED(ge->QueryInterface(__uuidof(ID3D11Texture2D),
+                                             reinterpret_cast<void **>(&gt))) && gt != nullptr)
+            {
+                if (BridgeEnsureExposure(dev11, gt))
+                    ctx->CopyResource(g_bridge.exp11, gt);
+                gt->Release();
+            }
+        }
+        else if (g_bridge.exp12 != nullptr)
+        {
+            // The game stopped supplying one. Sending the last frame's exposure
+            // for the rest of the session would be worse than sending none.
+            Log("[bridge] the game no longer supplies an exposure texture; the mirror "
+                "is dropped rather than left holding a stale one.");
+            BridgeReleaseExposure();
+        }
+    }
+
     // BridgeDisable is the one shutdown routine and releases every mirror, so
     // anything that can reach it from inside this frame leaves the rest of the
     // frame with null textures to barrier and copy. Checking the flag once at
@@ -2199,6 +2574,8 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
     g_bridge.params->Set("Output", g_bridge.tex12[SLOT_OUTPUT]);
     g_bridge.params->Set("Depth", g_bridge.tex12[SLOT_DEPTH]);
     g_bridge.params->Set("MotionVectors", g_bridge.tex12[SLOT_MV]);
+    if (g_bridge.exp12 != nullptr)
+        g_bridge.params->Set("ExposureTexture", g_bridge.exp12);
     // Mirror the game's own subrect description rather than inventing one. In an
     // upscaling preset the rendered area is a corner of a larger texture, and
     // guessing it is what made DLSS Quality produce a soft, effect-free image.

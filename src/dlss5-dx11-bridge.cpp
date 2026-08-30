@@ -39,7 +39,7 @@
 #pragma comment(lib, "version.lib")
 
 // Kept in step with version.rc, which is where ReShade's overlay reads it from.
-#define BRIDGE_VERSION "1.0.20"
+#define BRIDGE_VERSION "1.0.26"
 
 extern "C" __declspec(dllexport) const char *NAME =
     "DLSS 5 DX11 Bridge " BRIDGE_VERSION;
@@ -471,13 +471,24 @@ static const char *ShareText(UINT misc)
     return "  (not shared)";
 }
 
+// Defined in bridge.inc, included further down.
+static const char *NgxResultName(NVSDK_NGX_Result r);
+
 static void DumpTexture(const NVSDK_NGX_Parameter *p, const char *key)
 {
     ID3D11Resource *res = nullptr;
     NVSDK_NGX_Result r = p->Get(key, &res);
     if (r != NGX_SUCCESS || res == nullptr)
     {
-        Log("    %-22s  absent (result=%d)", key, r);
+        // Printed by name and in hex. As a signed decimal this read
+        // -1160773616 in every log ever collected, which is 0xBAD00010,
+        // UnsupportedParameter -- and nobody recognised it as a result code.
+        // A recognised key the game left empty and a key this runtime has never
+        // heard of are different answers, and "absent (Success)" read as neither.
+        if (r == NGX_SUCCESS)
+            Log("    %-34s  not set by the game", key);
+        else
+            Log("    %-34s  no such key here (%s, 0x%08X)", key, NgxResultName(r), r);
         return;
     }
 
@@ -523,6 +534,14 @@ static void DumpFloat(const NVSDK_NGX_Parameter *p, const char *key)
         Log("    %-40s = %.6f", key, static_cast<double>(v));
 }
 
+// A loaded module that exports the NGX entry points but is neither the driver's
+// loader nor an nvngx_* snippet. Empty when there is none.
+static wchar_t g_ngx_proxy[MAX_PATH];
+
+// The running NVIDIA driver as 56094 for 560.94, or 0 on a non-NVIDIA adapter.
+// Read at the first DLSS call, used again when the capability table is dumped.
+static unsigned g_nv_driver;
+
 // The adapter and driver were only recorded when the D3D12 session opened, so a
 // game that dies before that -- The Elder Scrolls Online does -- left a report
 // with no machine in it at all. The game's own D3D11 device knows the adapter,
@@ -551,11 +570,37 @@ static void LogAdapterOnce(ID3D11Device *dev)
 
     LARGE_INTEGER umd = {};
     if (SUCCEEDED(ad->CheckInterfaceSupport(__uuidof(IDXGIDevice), &umd)))
+    {
+        const unsigned f3 = static_cast<unsigned>((umd.LowPart >> 16) & 0xFFFF);
+        const unsigned f4 = static_cast<unsigned>(umd.LowPart & 0xFFFF);
         Log("  driver: %u.%u.%u.%u",
             static_cast<unsigned>((umd.HighPart >> 16) & 0xFFFF),
-            static_cast<unsigned>(umd.HighPart & 0xFFFF),
-            static_cast<unsigned>((umd.LowPart >> 16) & 0xFFFF),
-            static_cast<unsigned>(umd.LowPart & 0xFFFF));
+            static_cast<unsigned>(umd.HighPart & 0xFFFF), f3, f4);
+
+        // NVIDIA's own version is the last digit of the third field followed by
+        // the fourth: 32.0.15.6094 is 560.94 and 32.0.16.1656 is 616.56, both
+        // confirmed against the version ReShade prints in the same two logs.
+        // Reports arrive with the Windows number, discussions use NVIDIA's, and
+        // nothing here translated between them.
+        if (d.VendorId == 0x10DE)
+        {
+            const unsigned nv = (f3 % 10u) * 10000u + f4;
+            g_nv_driver = nv;
+            Log("  NVIDIA driver %u.%02u", nv / 100u, nv % 100u);
+
+            // Bumped when a release is verified on a newer driver. Older is not
+            // a fault by itself -- it is the first thing worth ruling out when
+            // an NGX feature will not create, and it is the one difference a
+            // reader cannot see without knowing what this was tested against.
+            const unsigned kVerifiedOn = 61656u;   // 616.56
+            if (nv < kVerifiedOn)
+                Log("  this driver is older than the %u.%02u this add-on is verified on. "
+                    "DLSS itself works far back, but neural rendering does not: Final "
+                    "Fantasy XIV on 560.94 could not create the feature and updating the "
+                    "driver fixed it. Update before investigating anything else.",
+                    kVerifiedOn / 100u, kVerifiedOn % 100u);
+        }
+    }
     ad->Release();
 }
 
@@ -608,7 +653,21 @@ static void DumpEvaluate(ID3D11DeviceContext *ctx, const NVSDK_NGX_Handle *handl
     DumpTexture(p, "MotionVectors");
     DumpTexture(p, "ExposureTexture");
     DumpTexture(p, "TransparencyMask");
-    DumpTexture(p, "BiasCurrentColorMask");
+
+    // "BiasCurrentColorMask" is not an NGX key. The header spells it
+    // DLSS.Input.Bias.Current.Color.Mask, so every "absent" this line has
+    // reported since it was written was a probe of a name nothing sets: whether
+    // any title supplies a bias mask is still unknown. The reactive mask is what
+    // a game marks its unstable pixels with -- particles, muzzle flashes,
+    // water -- and a DLSS that never receives it accumulates history over them.
+    DumpTexture(p, "DLSS.Input.Bias.Current.Color.Mask");
+
+    // The transparency layer arrived in a later SDK than the mask above and is
+    // probed for the same reason: to find out whether anything sets it before
+    // deciding whether it is worth mirroring.
+    DumpTexture(p, "DLSS.TransparencyLayer");
+    DumpTexture(p, "DLSS.TransparencyLayerOpacity");
+    DumpTexture(p, "DLSS.TransparencyLayerMvecs");
 
     Log("  scalars:");
     DumpUInt(p, "Width");
@@ -688,11 +747,55 @@ static HMODULE FindNgxLoader()
     DWORD   needed = 0;
     if (!enum_modules(GetCurrentProcess(), mods, sizeof(mods), &needed)) return nullptr;
 
-    for (DWORD i = 0; i < needed / sizeof(HMODULE); ++i)
-        if (GetProcAddress(mods[i], "NVSDK_NGX_D3D12_Init_ProjectID") != nullptr &&
-            GetProcAddress(mods[i], "NVSDK_NGX_D3D12_CreateFeature") != nullptr)
+    // Taking the first module that exports these was wrong. Prey 2017 loads a
+    // third-party WINMM.dll that exports the NGX D3D12 entry points too, it is
+    // enumerated before the driver's own loader because it comes from the game
+    // folder, and calling its Init_Ext faulted -- while the DLSS 5 add-on had
+    // meanwhile hooked the driver's copy, so the two were not even talking about
+    // the same NGX. NVIDIA's loader is named _nvngx.dll wherever it lives, so
+    // that name wins; a game-folder proxy under the same name still wins over an
+    // unrelated wrapper, which is right, because that is the one the game reaches.
+    HMODULE first = nullptr;
+    g_ngx_proxy[0] = 0;
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        for (DWORD i = 0; i < needed / sizeof(HMODULE); ++i)
+        {
+            if (GetProcAddress(mods[i], "NVSDK_NGX_D3D12_Init_ProjectID") == nullptr ||
+                GetProcAddress(mods[i], "NVSDK_NGX_D3D12_CreateFeature") == nullptr)
+                continue;
+
+            wchar_t path[MAX_PATH] = {};
+            GetModuleFileNameW(mods[i], path, MAX_PATH);
+            const wchar_t *leaf = wcsrchr(path, (wchar_t)92);   // backslash
+            leaf = leaf != nullptr ? leaf + 1 : path;
+
+            if (pass == 0)
+            {
+                if (_wcsicmp(leaf, L"_nvngx.dll") != 0)
+                {
+                    if (first == nullptr) first = mods[i];
+                    // Remembered so a later failure can name it. A module that
+                    // is neither the driver's loader nor an nvngx_* snippet, yet
+                    // exports the NGX entry points, is a proxy standing in for
+                    // NGX -- OptiScaler installed as winmm.dll is one, and it
+                    // patches code inside the driver's module as well.
+                    if (g_ngx_proxy[0] == 0 && _wcsnicmp(leaf, L"nvngx", 5) != 0)
+                        wcsncpy_s(g_ngx_proxy, path, _TRUNCATE);
+                    continue;
+                }
+                Log("[bridge] NGX D3D12 entry points taken from %ls", path);
+                return mods[i];
+            }
+            // Second pass: no driver loader is present under its own name.
+            Log("[bridge] no _nvngx.dll is loaded; NGX D3D12 entry points taken from "
+                "%ls instead. A module that is not NVIDIA's loader exporting these is "
+                "worth noting if the session then fails.", path);
             return mods[i];
-    return nullptr;
+        }
+        if (pass == 0 && first == nullptr) break;
+    }
+    return first;
 }
 
 // Every NGX entry point below is called through a guarded wrapper. These are
@@ -701,12 +804,54 @@ static HMODULE FindNgxLoader()
 // own function with no C++ objects so __try is legal and no unwinding is needed.
 #define NGX_EXCEPTION_MARKER 0x7FFFFFFF
 
+// Where the last guarded call faulted, and whose module owns that address.
+// GetExceptionCode() alone gave every fault the same log line, so three
+// competing explanations for Prey 2017 all produced identical evidence. The
+// filter runs before the stack unwinds, which is the only place the address is
+// available. NameFaultOwner uses the same lookup the crash reporter does.
+static void *g_last_fault_at;
+
+static int CaptureFault(EXCEPTION_POINTERS *ep)
+{
+    g_last_fault_at = ep != nullptr && ep->ExceptionRecord != nullptr
+                    ? ep->ExceptionRecord->ExceptionAddress : nullptr;
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// Fills out with the module owning the last fault, or a description of why no
+// module owns it. Returns false when there was no address to resolve.
+static bool NameFaultOwner(wchar_t *out, size_t n)
+{
+    if (g_last_fault_at == nullptr) return false;
+    HMODULE mod = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           static_cast<LPCWSTR>(g_last_fault_at), &mod) && mod != nullptr)
+    {
+        wchar_t path[MAX_PATH] = {};
+        GetModuleFileNameW(mod, path, MAX_PATH);
+        // The offset is what a symbol file can be matched against; the absolute
+        // address changes every run and is useless to the module's author.
+        _snwprintf_s(out, n, _TRUNCATE, L"%ls +0x%llX", path,
+                     static_cast<unsigned long long>(
+                         static_cast<const unsigned char *>(g_last_fault_at) -
+                         reinterpret_cast<const unsigned char *>(mod)));
+        return true;
+    }
+
+    // No owning module is itself an answer: code that has been unloaded, or a
+    // page mapped without being registered as a module, both land here.
+    wcsncpy_s(out, n, L"no loaded module owns that address", _TRUNCATE);
+    return true;
+}
+
 static NVSDK_NGX_Result SafeInitExt(PFN_Init_Ext fn, unsigned long long app_id,
                                     const wchar_t *path, ID3D12Device *dev, int ver, DWORD *code)
 {
     *code = 0;
     __try { return fn(app_id, path, dev, ver, nullptr); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return NGX_EXCEPTION_MARKER; }
+    __except (CaptureFault(GetExceptionInformation()))
+    { *code = GetExceptionCode(); return NGX_EXCEPTION_MARKER; }
 }
 
 static NVSDK_NGX_Result SafeInitProjectID(PFN_Init_ProjectID fn, const char *project,
@@ -715,7 +860,8 @@ static NVSDK_NGX_Result SafeInitProjectID(PFN_Init_ProjectID fn, const char *pro
 {
     *code = 0;
     __try { return fn(project, 0 /* ENGINE_TYPE_CUSTOM */, "1.0", path, dev, ver, nullptr); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return NGX_EXCEPTION_MARKER; }
+    __except (CaptureFault(GetExceptionInformation()))
+    { *code = GetExceptionCode(); return NGX_EXCEPTION_MARKER; }
 }
 
 
@@ -723,14 +869,16 @@ static NVSDK_NGX_Result SafeAllocParams(PFN_AllocateParameters fn, NVSDK_NGX_Par
 {
     *code = 0;
     __try { return fn(out); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return NGX_EXCEPTION_MARKER; }
+    __except (CaptureFault(GetExceptionInformation()))
+    { *code = GetExceptionCode(); return NGX_EXCEPTION_MARKER; }
 }
 
 static NVSDK_NGX_Result SafeGetCaps(PFN_GetCapabilityParameters fn, NVSDK_NGX_Parameter **out, DWORD *code)
 {
     *code = 0;
     __try { return fn(out); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return NGX_EXCEPTION_MARKER; }
+    __except (CaptureFault(GetExceptionInformation()))
+    { *code = GetExceptionCode(); return NGX_EXCEPTION_MARKER; }
 }
 
 static NVSDK_NGX_Result SafeCreateFeature(PFN_D3D12CreateFeature fn, ID3D12GraphicsCommandList *list,
@@ -738,7 +886,8 @@ static NVSDK_NGX_Result SafeCreateFeature(PFN_D3D12CreateFeature fn, ID3D12Graph
 {
     *code = 0;
     __try { return fn(list, 1 /* SuperSampling */, p, out); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return NGX_EXCEPTION_MARKER; }
+    __except (CaptureFault(GetExceptionInformation()))
+    { *code = GetExceptionCode(); return NGX_EXCEPTION_MARKER; }
 }
 
 
@@ -759,6 +908,9 @@ static void LogEntryBytes(const char *label, void *fn)
     Log("    %-34s %p  %s %s", label, fn, hex, detoured ? " <== DETOURED" : "");
 }
 
+// Defined in bridge.inc, which is included below this point.
+static const char *NgxResultName(NVSDK_NGX_Result r);
+
 static void DumpCapability(NVSDK_NGX_Parameter *caps)
 {
     static const char *int_keys[] = {
@@ -767,19 +919,75 @@ static void DumpCapability(NVSDK_NGX_Parameter *caps)
         "SuperSampling.MinDriverVersionMajor",
         "SuperSampling.MinDriverVersionMinor",
         "SuperSamplingDenoising.Available",
+        "SuperSamplingDenoising.NeedsUpdatedDriver",
+        "SuperSamplingDenoising.MinDriverVersionMajor",
+        "SuperSamplingDenoising.MinDriverVersionMinor",
     };
+    bool denoising_answered = false;
+    int  denoising_available = 0;
+    int  min_major = 0, min_minor = 0;
     for (const char *k : int_keys)
     {
         int v = 0;
         NVSDK_NGX_Result r = caps->Get(k, &v);
-        if (r == NGX_SUCCESS) Log("      %-40s = %d", k, v);
-        else                  Log("      %-40s   query failed 0x%08X", k, r);
+        if (r == NGX_SUCCESS) Log("      %-44s = %d", k, v);
+        else                  Log("      %-44s   query failed 0x%08X, %s", k, r,
+                                  NgxResultName(r));
+
+        if (_stricmp(k, "SuperSamplingDenoising.Available") == 0)
+        {
+            denoising_answered = (r == NGX_SUCCESS);
+            denoising_available = v;
+        }
+        else if (r == NGX_SUCCESS &&
+                 _stricmp(k, "SuperSamplingDenoising.MinDriverVersionMajor") == 0)
+            min_major = v;
+        else if (r == NGX_SUCCESS &&
+                 _stricmp(k, "SuperSamplingDenoising.MinDriverVersionMinor") == 0)
+            min_minor = v;
     }
+
+    // This minimum belongs to SuperSamplingDenoising -- Ray Reconstruction, a
+    // 2023 feature -- and NOT to the neural-rendering feature a DLSS 5 add-on
+    // creates, which NGX exposes no capability key for at all. Being above this
+    // number says nothing about that one, and reading it as though it did is
+    // what led an analysis to clear a driver that was in fact the cause.
+    // Printed as the two fields the driver reports them in. Recomposing them into
+    // one number needs that field's convention, and padding the minor to the two
+    // digits an NVIDIA version uses turned a reported 537.2 into 537.02.
+    if (min_major > 0 && g_nv_driver > 0)
+        Log("[bridge]   %d.%d is this driver's stated minimum for Ray Reconstruction, "
+            "and the running driver is %u.%02u. Neural rendering is a later and "
+            "separate feature with no capability key of its own, so this line does "
+            "not speak for it.",
+            min_major, min_minor, g_nv_driver / 100u, g_nv_driver % 100u);
+
+    // The whole point of a DLSS 5 add-on is a neural-rendering feature on the
+    // D3D12 side, and when it will not create, the report says so in its own
+    // words while this log printed the reason in raw hexadecimal and left it at
+    // that. Final Fantasy XIV on driver 32.0.15.6094 answers the denoising
+    // capability query with UnsupportedParameter and the add-on's feature 18
+    // create fails with PlatformError. State what was read; the driver version
+    // is logged at the first DLSS call, a few lines above this one.
+    if (!denoising_answered)
+        Log("[bridge]   this driver does not carry the denoising capability key at all. "
+            "Final Fantasy XIV on 560.94 answered this query the same way, its DLSS 5 "
+            "add-on could not create a neural-rendering feature, and updating the "
+            "driver fixed it. Update the driver before looking anywhere else.");
+    else if (denoising_available == 0)
+        Log("[bridge]   this driver reports denoising as unavailable. A D3D12 add-on "
+            "asking for a neural-rendering feature will not get one, and that refusal "
+            "is the driver's rather than this bridge's.");
 }
 
 // bridge.inc prints this before D3D12CreateDevice, and the include comes long
 // before the definition.
 static void LogPrologue(const char *label, const BYTE *p);
+
+// Set around this add-on's own NGX initialisation. Hooking a module while NGX
+// is loading its snippets is what took Prey 2017 down.
+static volatile bool g_ngx_init_in_flight;
+static volatile bool g_scan_pending;
 
 #include "bridge.inc"
 
@@ -791,6 +999,7 @@ static void LogPrologue(const char *label, const BYTE *p);
 // Defined with the idle report it withdraws.
 static void RetractIdleNote();
 static void TryInstallHooks();
+
 
 // Two builds of one NGX snippet in a single process is a configuration nobody
 // would notice by reading version lines one at a time. Escape from Tarkov runs
@@ -1016,6 +1225,10 @@ static NVSDK_NGX_Result ForwardEvaluate(Hook &h, const char *tag, ID3D11DeviceCo
     // The loader notification is allowed to give up rather than block, so a
     // module can be missed. This is the same scan from the render thread, where
     // no loader lock is held and giving up costs nothing.
+    // A scan deferred out of the loader-lock callback is serviced here, where
+    // nothing is held.
+    if (g_scan_pending && !g_ngx_init_in_flight)
+    { g_scan_pending = false; TryInstallHooks(); }
     if ((n % 600) == 0) TryInstallHooks();
     if (n <= 5 || (n % 1800) == 0)
     {
@@ -1140,6 +1353,22 @@ static NVSDK_NGX_Result ForwardCreate(Hook &h, ID3D11DeviceContext *ctx, int fea
 
     // 1 is DLSS super resolution, the only feature whose contract this bridge
     // knows how to mirror.
+    // Nothing ever removed entries, and NGX recycles freed handle addresses. A
+    // super-resolution feature created at an address this table still holds
+    // would take the "not super resolution" branch on every evaluate for the
+    // rest of the session -- the add-on silently doing nothing while the game
+    // renders on its own DLSS. A successful super-resolution create at an
+    // address is exactly the event that invalidates an older entry for it.
+    if (feature_id == 1 && r == NGX_SUCCESS && out != nullptr && *out != nullptr)
+        for (LONG i = 0; i < g_other_feature_count; ++i)
+            if (g_other_feature[i] == *out)
+            {
+                g_other_feature[i] = g_other_feature[--g_other_feature_count];
+                Log("  handle %p was recorded as another feature and has been reused "
+                    "for super resolution; the old entry is dropped.", *out);
+                break;
+            }
+
     if (feature_id != 1 && r == NGX_SUCCESS && out != nullptr && *out != nullptr &&
         g_other_feature_count < static_cast<LONG>(_countof(g_other_feature)))
     {
@@ -1325,7 +1554,15 @@ static int HookNewNgxModules()
             continue;
         }
 
-        const LONG slot = g_layer_count;
+        // Slots used to be handed out forward only, so every unload and reload
+        // of an NGX module burned one permanently and a long session could run
+        // out of a table it was no longer using. ForgetUnloadedLayer nulls mod,
+        // which is what makes a slot free: HookInstall overwrites a slot whole
+        // and LAYER_DETOURS binds by index, so reuse is safe.
+        LONG slot = g_layer_count;
+        for (LONG k = 0; k < g_layer_count; ++k)
+            if (g_layer[k].mod == nullptr) { slot = k; break; }
+
         Layer &L = g_layer[slot];
         L.mod = mods[i];
 
@@ -1359,7 +1596,7 @@ static int HookNewNgxModules()
             eval   != nullptr ? (ok_eval   ? "yes" : "FAILED") : "absent",
             eval_c != nullptr ? (ok_eval_c ? "yes" : "FAILED") : "absent");
 
-        InterlockedIncrement(&g_layer_count);
+        if (slot == g_layer_count) InterlockedIncrement(&g_layer_count);
         ++added;
     }
     return added;
@@ -1437,7 +1674,19 @@ static void LogNeighbours()
         L"nvngx_dlss.dll",         // optional, a newer super-resolution model
     };
 
+    // ReShade can be told to load add-ons from a directory that is not the game's
+    // own, and Phantasy Star Online 2 is the first report where they differ. The
+    // old text said "missing from the game folder" while the code had only looked
+    // beside the add-on, so a file plainly sitting next to the executable was
+    // announced as absent -- and the same log then loaded it from there.
+    wchar_t exe_dir[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exe_dir, MAX_PATH);
+    if (wchar_t *sl = wcsrchr(exe_dir, (wchar_t)92)) *(sl + 1) = 0;
+    const bool split = _wcsicmp(exe_dir, dir) != 0;
+
     Log("  files next to this add-on:");
+    if (split)
+        Log("    the add-on is not in the game's own folder, so both are checked:");
     for (int i = 0; i < 2; ++i)
     {
         const wchar_t *n = needed[i];
@@ -1445,14 +1694,25 @@ static void LogNeighbours()
         wcscpy_s(p, dir);
         wcscat_s(p, n);
         const bool here = GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES;
-        if (here) LogFileVersion(dir, n, "present");
-        else      Log("    %-26ls MISSING", n);
+
+        bool at_exe = false;
+        if (!here && split)
+        {
+            wchar_t q[MAX_PATH];
+            wcscpy_s(q, exe_dir);
+            wcscat_s(q, n);
+            at_exe = GetFileAttributesW(q) != INVALID_FILE_ATTRIBUTES;
+        }
+
+        if (here)        LogFileVersion(dir, n, "present");
+        else if (at_exe) LogFileVersion(exe_dir, n, "present beside the game");
+        else             Log("    %-26ls MISSING from both", n);
 
         // The model file is NVIDIA's, and its name is fixed by NVIDIA rather than
         // by anyone's add-on, so its absence can be raised where it is seen.
-        if (!here && i == 0)
-            Warn("%ls is missing from the game folder. The DLSS 5 add-on loads its "
-                 "neural-rendering model from that file.", n);
+        if (!here && !at_exe && i == 0)
+            Warn("%ls is in neither the add-on's folder nor the game's. The DLSS 5 "
+                 "add-on loads its neural-rendering model from that file.", n);
     }
 
     // Everything else that could be taking part, so conflicts are visible.
@@ -1464,7 +1724,18 @@ static void LogNeighbours()
     if (h != INVALID_HANDLE_VALUE)
     {
         Log("  add-ons present:");
-        do { LogFileVersion(dir, fd.cFileName, ""); } while (FindNextFileW(h, &fd));
+        do
+        {
+            LogFileVersion(dir, fd.cFileName, "");
+
+            // Where each add-on is mapped, so a fault address can be turned into
+            // an offset by whoever owns that add-on. Prey 2017 faults inside
+            // Luma-Prey.addon during NGX initialisation and the address alone
+            // told its author nothing. Only loaded add-ons have a base; one that
+            // ReShade has not loaded yet simply has no line.
+            if (HMODULE m = GetModuleHandleW(fd.cFileName))
+                Log("        loaded at %p", static_cast<void *>(m));
+        } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
 
@@ -1738,8 +2009,33 @@ static void ForgetUnloadedLayer(const void *base)
 static void CALLBACK OnDllLoaded(ULONG reason, const void *data, void *)
 {
     // 1 is LDR_DLL_NOTIFICATION_REASON_LOADED, 2 is UNLOADED. This runs under
-    // the loader lock, so it does the least it can.
-    if (reason == 1) { TryInstallHooks(); ReportIdle(); }
+    // the loader lock, on the thread doing the load, and what follows is not the
+    // least it can do: it enumerates modules, reads version resources from disk,
+    // and writes fourteen bytes of jump into code.
+    //
+    // NVSDK_NGX_D3D12_Init_Ext loads nvngx_dlss.dll itself, so in Prey 2017 this
+    // fires inside NGX's own initialisation and patches the snippet NGX is
+    // setting up -- while Luma, which also watches for NGX modules in that game,
+    // is on the same stack. Defer the scan to a caller holding no lock.
+    //
+    // Unload bookkeeping stays here: it only nulls pointers, and missing one
+    // leaves a hook pointing at memory that is gone.
+    if (reason == 1)
+    {
+        if (g_ngx_init_in_flight)
+        {
+            // Said once. Its presence in a log is the proof that this guard ran;
+            // a silent fix is one nobody can tell apart from a missing one.
+            static bool said;
+            if (!said) { said = true; Log("a module loaded while NGX was initialising; "
+                                          "the hook scan is deferred until nothing holds "
+                                          "the loader lock."); }
+            g_scan_pending = true;
+            return;
+        }
+        TryInstallHooks();
+        ReportIdle();
+    }
     else if (reason == 2 && data != nullptr)
         ForgetUnloadedLayer(static_cast<const LdrDllNotificationData *>(data)->DllBase);
 }
@@ -1840,6 +2136,99 @@ static bool RegisterWithReShade(HMODULE self)
     return false;
 }
 
+// A standalone NGX D3D12 probe, off unless dlss5-dx11-bridge.cfg says probe=1.
+//
+// The bridge only opens its D3D12 session when the game calls DLSS, which makes
+// some questions untestable: Prey 2017 has no DLSS of its own, so removing the
+// Luma add-on to see whether Luma is what NVSDK_NGX_D3D12_Init_Ext faults inside
+// also removes every DLSS call, and nothing runs at all. This does the same two
+// calls on its own, on its own device, so the answer no longer depends on the
+// game providing a DLSS feature.
+//
+// It runs once, on its own thread, after a delay long enough for the other
+// add-ons to have registered whatever they register.
+static DWORD WINAPI NgxProbeThread(LPVOID)
+{
+    Sleep(20000);
+
+    Log("");
+    Log("################ NGX probe (probe=1) ################");
+    HMODULE d3d12 = LoadLibraryW(L"d3d12.dll");
+    if (d3d12 == nullptr) { Log("[probe] d3d12.dll would not load"); return 0; }
+
+    auto create_device = reinterpret_cast<PFN_D3D12CreateDevice_>(
+        GetProcAddress(d3d12, "D3D12CreateDevice"));
+    if (create_device == nullptr) { Log("[probe] no D3D12CreateDevice export"); return 0; }
+
+    ID3D12Device *dev = nullptr;
+    DWORD code = 0;
+    HRESULT hr = SafeCreateDevice(create_device, nullptr, &dev, &code);
+    if (code != 0 || FAILED(hr) || dev == nullptr)
+    {
+        wchar_t owner[MAX_PATH] = {};
+        if (code != 0 && NameFaultOwner(owner, MAX_PATH))
+            Log("[probe] D3D12CreateDevice raised 0x%08X at %p, inside %ls",
+                code, g_last_fault_at, owner);
+        else
+            Log("[probe] D3D12CreateDevice failed 0x%08X (exception 0x%08X)", hr, code);
+        Log("############# NGX probe done #############");
+        return 0;
+    }
+    Log("[probe] D3D12 device created");
+
+    HMODULE ngx = FindNgxLoader();
+    if (ngx == nullptr) { Log("[probe] no NGX loader is present"); dev->Release(); return 0; }
+
+    auto init_ext = reinterpret_cast<PFN_Init_Ext>(
+        GetProcAddress(ngx, "NVSDK_NGX_D3D12_Init_Ext"));
+    if (init_ext == nullptr) { Log("[probe] no NVSDK_NGX_D3D12_Init_Ext export"); dev->Release(); return 0; }
+
+    wchar_t data_path[MAX_PATH] = {};
+    GetModuleFileNameW(g_self, data_path, MAX_PATH);
+    if (wchar_t *sl = wcsrchr(data_path, (wchar_t)92)) *(sl + 1) = 0;
+
+    code = 0;
+    NVSDK_NGX_Result r = SafeInitExt(init_ext, 0x1000000ULL, data_path, dev, 0x13, &code);
+    if (code != 0)
+    {
+        wchar_t owner[MAX_PATH] = {};
+        if (NameFaultOwner(owner, MAX_PATH))
+            Log("[probe] Init_Ext raised 0x%08X at %p, inside %ls", code, g_last_fault_at, owner);
+        else
+            Log("[probe] Init_Ext raised 0x%08X", code);
+        Log("[probe] the fault does not need the game to call DLSS, so it belongs to "
+            "this process rather than to any DLSS contract.");
+    }
+    else
+    {
+        Log("[probe] Init_Ext -> %s (0x%08X, %s)",
+            r == NGX_SUCCESS ? "ok" : "refused", r, NgxResultName(r));
+    }
+
+    dev->Release();
+    Log("############# NGX probe done #############");
+    return 0;
+}
+
+// Reads one key straight from the config file: the probe decides whether to run
+// before the bridge has parsed anything.
+static bool ProbeRequested()
+{
+    char path[MAX_PATH] = {};
+    GetModuleFileNameA(g_self, path, MAX_PATH);
+    if (char *sl = strrchr(path, (char)92))   // backslash
+        strcpy_s(sl + 1, MAX_PATH - (sl + 1 - path), "dlss5-dx11-bridge.cfg");
+
+    FILE *f = nullptr;
+    if (fopen_s(&f, path, "r") != 0 || f == nullptr) return false;
+    char line[256];
+    bool on = false;
+    while (fgets(line, sizeof(line), f) != nullptr)
+        if (_strnicmp(line, "probe=1", 7) == 0) { on = true; break; }
+    fclose(f);
+    return on;
+}
+
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH)
@@ -1856,6 +2245,12 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 
         if (!RegisterWithReShade(module))
             return FALSE;  // ReShade will unload us; do not leave hooks behind
+
+        // Opt-in and off by default: it creates a D3D12 device in every game
+        // that turns it on. The thread does not start until DllMain returns.
+        if (ProbeRequested())
+            if (HANDLE t = CreateThread(nullptr, 0, NgxProbeThread, nullptr, 0, nullptr))
+                CloseHandle(t);
 
         // Carry forward the previous run's crash report, if it left one. This
         // looks for a marker the crash handler writes, not for the absence of a

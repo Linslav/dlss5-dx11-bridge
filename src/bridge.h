@@ -64,6 +64,7 @@ struct Bridge
     // stays whatever it was -- the two halves people see.
     bool      partial_output;
     bool      partial_reported;
+    bool      presets_reported;   // the render preset list is said once per session
 
     UINT      slot_w[4];
     UINT      slot_h[4];
@@ -113,6 +114,17 @@ struct Bridge
 
     NVSDK_NGX_Parameter *params;
     NVSDK_NGX_Handle    *feature;
+
+    // The exposure texture is kept apart from the slot array rather than made a
+    // fifth slot: every SLOT_COUNT loop dereferences its entry unconditionally,
+    // and the games that supply no exposure texture -- ESO, Final Fantasy XIV --
+    // would take a null through all of them.
+    ID3D12Resource  *exp12;
+    ID3D11Texture2D *exp11;
+    HANDLE           exp_shared;
+    unsigned int     exp_w, exp_h;
+    DXGI_FORMAT      exp_fmt;
+    bool             exp_reported;
 
     ID3D12Resource  *tex12[SLOT_COUNT];
     ID3D11Texture2D *tex11[SLOT_COUNT];
