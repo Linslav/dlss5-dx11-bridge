@@ -79,6 +79,7 @@ trigger a rebuild automatically.
 | `reset_every` | 0 | `1` forces the NGX Reset flag every frame, discarding temporal history. Diagnostic only. |
 | `pixels` | 0 | `1` reads pixels back to the CPU for debugging. Stalls the GPU hard. |
 | `adapter` | 0 | Experimental device selection: `0` uses the game adapter (upstream), `1` asks Windows for the default adapter, and `2` retries with the default adapter only after a caught game-adapter fault. Takes effect when a new D3D12 session opens. |
+| `d3d12_hook` | 0 | Diagnostic only. `1` bypasses a verified five-byte `D3D12CreateDevice` entry detour for the guarded device-creation call, then restores it immediately. Any unexpected byte pattern fails closed and leaves the hook in place. |
 
 ### Final Fantasy XV diagnostic build
 
@@ -87,6 +88,13 @@ the private D3D12 device with its D3D11-derived adapter. This fork adds the
 opt-in `adapter` strategies above. Start with `stage=0`, `dred=0`, and
 `adapter=1`; after confirming normal rendering, use `stage=3` on a fresh
 launch. The exception guard and normal-rendering fallback remain intact.
+
+If both game-adapter and default-adapter creation fault with the same pre-existing
+entry detour, `d3d12_hook=1` is the next isolation step. It maps the exact
+System32 `d3d12.dll` as non-executable data, verifies that ReShade's five-byte
+jump replaced one complete five-byte instruction, restores that instruction
+only around the guarded call, and reinstates the jump before continuing. It
+refuses to act on any different byte shape.
 
 This repository contains bridge source only. It does not distribute NVIDIA
 NGX or Neural Rendering binaries.

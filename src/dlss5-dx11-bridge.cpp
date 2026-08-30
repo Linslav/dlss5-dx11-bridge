@@ -39,7 +39,7 @@
 #pragma comment(lib, "version.lib")
 
 // Kept in step with version.rc, which is where ReShade's overlay reads it from.
-#define BRIDGE_VERSION "1.0.27.1-ffxv"
+#define BRIDGE_VERSION "1.0.27.2-ffxv"
 
 extern "C" __declspec(dllexport) const char *NAME =
     "DLSS 5 DX11 Bridge " BRIDGE_VERSION;
@@ -1345,6 +1345,11 @@ static NVSDK_NGX_Result ForwardEvaluate(Hook &h, const char *tag, ID3D11DeviceCo
     // session creates a device and starts an NGX session, and on some drivers
     // that is itself the thing that crashes. An off switch that still does the
     // dangerous part is not an off switch.
+    // Reload here rather than only inside BridgeFrame: at stage=0 there is no
+    // D3D12 session, and BridgeFrame deliberately returns before its reload.
+    // Without this call the documented live stage=0 -> stage=1/2/3 transition
+    // can never happen.
+    CfgReload();
     if (g_cfg.stage >= 1 && InterlockedCompareExchange(&g_probe_done, 1, 0) == 0)
     {
         ID3D11Device *dev = nullptr;

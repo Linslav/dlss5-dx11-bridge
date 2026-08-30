@@ -32,6 +32,11 @@ static NVSDK_NGX_Result SafeEvaluateGuarded(PFN_D3D12EvaluateFeature fn,
 //                    1 nullptr, asking Windows for the default adapter
 //                    2 game adapter, then default adapter after a caught fault
 //                  Read when the D3D12 session opens.
+//   d3d12_hook=1   0 calls the existing D3D12CreateDevice entry point. 1 may
+//                  bypass a five-byte entry detour for this call only, after
+//                  verifying it against a non-executable System32 image map.
+//                  The detour is restored immediately, including after a
+//                  caught exception. Diagnostic only, and fail-closed.
 //   flags=-1       DLSS.Feature.Create.Flags. -1 copies whatever the game
 //                  asked for, which is the only value guaranteed to describe
 //                  the game's own buffers. Any other value forces that value:
@@ -102,9 +107,10 @@ struct BridgeCfg
     int skip_exe;
     int unwrap;
     int adapter;
+    int d3d12_hook;
 };
 
-static BridgeCfg g_cfg = { 2, -1, 1, 0, 0, 3, 1, 1, 1, 1, 0 };
+static BridgeCfg g_cfg = { 2, -1, 1, 0, 0, 3, 1, 1, 1, 1, 0, 0 };
 
 // Accumulates the two figures and reports them together, because either one
 // alone is misleading.
@@ -248,6 +254,7 @@ static void CfgReload()
         else if (_stricmp(key, "skip_exe")    == 0) next.skip_exe    = val;
         else if (_stricmp(key, "unwrap")      == 0) next.unwrap      = val;
         else if (_stricmp(key, "adapter")     == 0) next.adapter     = val;
+        else if (_stricmp(key, "d3d12_hook")  == 0) next.d3d12_hook = val;
         else if (_stricmp(key, "subrects")    == 0) next.subrects    = val;
         else if (_stricmp(key, "reset_every") == 0) next.reset_every = val;
         else if (_stricmp(key, "pixels")      == 0) next.pixels      = val;
@@ -259,20 +266,23 @@ static void CfgReload()
 
     if (next.mode < 0 || next.mode > 2) next.mode = g_cfg.mode;
     if (next.adapter < 0 || next.adapter > 2) next.adapter = g_cfg.adapter;
+    if (next.d3d12_hook < 0 || next.d3d12_hook > 1) next.d3d12_hook = g_cfg.d3d12_hook;
 
     const bool rebuild = (next.flags != g_cfg.flags) || (next.subrects != g_cfg.subrects);
     const bool changed = rebuild || (next.mode != g_cfg.mode) ||
                          (next.reset_every != g_cfg.reset_every) || (next.pixels != g_cfg.pixels) ||
                          (next.stage != g_cfg.stage) || (next.skip_game != g_cfg.skip_game) ||
                          (next.dred != g_cfg.dred) || (next.skip_exe != g_cfg.skip_exe) ||
-                         (next.unwrap != g_cfg.unwrap) || (next.adapter != g_cfg.adapter);
+                         (next.unwrap != g_cfg.unwrap) || (next.adapter != g_cfg.adapter) ||
+                         (next.d3d12_hook != g_cfg.d3d12_hook);
     if (!changed) return;
 
     g_cfg = next;
     Log("[bridge] config: stage=%d mode=%d flags=%d subrects=%d reset_every=%d pixels=%d "
-        "skip_game=%d dred=%d skip_exe=%d unwrap=%d adapter=%d",
+        "skip_game=%d dred=%d skip_exe=%d unwrap=%d adapter=%d d3d12_hook=%d",
         g_cfg.stage, g_cfg.mode, g_cfg.flags, g_cfg.subrects, g_cfg.reset_every, g_cfg.pixels,
-        g_cfg.skip_game, g_cfg.dred, g_cfg.skip_exe, g_cfg.unwrap, g_cfg.adapter);
+        g_cfg.skip_game, g_cfg.dred, g_cfg.skip_exe, g_cfg.unwrap, g_cfg.adapter,
+        g_cfg.d3d12_hook);
 
     // Creation-time values only take effect on a new feature, so invalidate the
     // current one and let the next frame build it again.
@@ -287,10 +297,10 @@ static void CfgWriteDefault()
 
     FILE *f = nullptr;
     if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
-    fprintf(f, "stage=%d\nmode=%d\nskip_game=%d\nflags=%d\nsubrects=%d\nreset_every=%d\npixels=%d\ndred=%d\nskip_exe=%d\nunwrap=%d\nadapter=%d\n",
+    fprintf(f, "stage=%d\nmode=%d\nskip_game=%d\nflags=%d\nsubrects=%d\nreset_every=%d\npixels=%d\ndred=%d\nskip_exe=%d\nunwrap=%d\nadapter=%d\nd3d12_hook=%d\n",
             g_cfg.stage, g_cfg.mode, g_cfg.skip_game, g_cfg.flags, g_cfg.subrects,
             g_cfg.reset_every, g_cfg.pixels, g_cfg.dred, g_cfg.skip_exe, g_cfg.unwrap,
-            g_cfg.adapter);
+            g_cfg.adapter, g_cfg.d3d12_hook);
     fclose(f);
     Log("[bridge] wrote default config to %s", path);
 }
@@ -405,6 +415,123 @@ static void UnwrapReShadeProxy(ID3D12Device **dev)
 
 // The fault here was reported inside D3D12Core.dll on an older release; device
 // creation now succeeds and what follows is where Prey stops.
+// Reads an export from a non-executable SEC_IMAGE mapping of the exact DLL
+// backing the live module. This supplies pristine bytes without loading a
+// second executable D3D12 runtime into the process.
+static bool ReadPristineExport(HMODULE live, const char *name, BYTE *out, SIZE_T count)
+{
+    wchar_t path[MAX_PATH] = {};
+    if (GetModuleFileNameW(live, path, MAX_PATH) == 0) return false;
+
+    HANDLE file = CreateFileW(path, GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+
+    HANDLE mapping = CreateFileMappingW(file, nullptr,
+        PAGE_READONLY | SEC_IMAGE_NO_EXECUTE, 0, 0, nullptr);
+    if (mapping == nullptr) { CloseHandle(file); return false; }
+
+    BYTE *base = static_cast<BYTE *>(MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0));
+    bool ok = false;
+    if (base != nullptr)
+    {
+        const IMAGE_DOS_HEADER *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(base);
+        if (dos->e_magic == IMAGE_DOS_SIGNATURE)
+        {
+            const IMAGE_NT_HEADERS64 *nt = reinterpret_cast<const IMAGE_NT_HEADERS64 *>(
+                base + dos->e_lfanew);
+            if (nt->Signature == IMAGE_NT_SIGNATURE &&
+                nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+            {
+                const DWORD image_size = nt->OptionalHeader.SizeOfImage;
+                const IMAGE_DATA_DIRECTORY dir = nt->OptionalHeader.DataDirectory[
+                    IMAGE_DIRECTORY_ENTRY_EXPORT];
+                if (dir.VirtualAddress != 0 && dir.VirtualAddress < image_size)
+                {
+                    const IMAGE_EXPORT_DIRECTORY *exp =
+                        reinterpret_cast<const IMAGE_EXPORT_DIRECTORY *>(
+                            base + dir.VirtualAddress);
+                    const DWORD *names = reinterpret_cast<const DWORD *>(
+                        base + exp->AddressOfNames);
+                    const WORD *ordinals = reinterpret_cast<const WORD *>(
+                        base + exp->AddressOfNameOrdinals);
+                    const DWORD *functions = reinterpret_cast<const DWORD *>(
+                        base + exp->AddressOfFunctions);
+                    for (DWORD i = 0; i < exp->NumberOfNames; ++i)
+                    {
+                        if (names[i] >= image_size || strcmp(
+                                reinterpret_cast<const char *>(base + names[i]), name) != 0)
+                            continue;
+                        const WORD ordinal = ordinals[i];
+                        if (ordinal >= exp->NumberOfFunctions) break;
+                        const DWORD rva = functions[ordinal];
+                        if (rva < image_size && count <= image_size - rva)
+                        {
+                            memcpy(out, base + rva, count);
+                            ok = true;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        UnmapViewOfFile(base);
+    }
+    CloseHandle(mapping);
+    CloseHandle(file);
+    return ok;
+}
+
+static bool RestorePristineD3D12Entry(PFN_D3D12CreateDevice_ fn,
+                                      BYTE saved[5], DWORD *old_protect)
+{
+    BYTE pristine[5] = {};
+    BYTE *entry = reinterpret_cast<BYTE *>(fn);
+    HMODULE d3d12 = GetModuleHandleW(L"d3d12.dll");
+    if (d3d12 == nullptr || !ReadPristineExport(d3d12, "D3D12CreateDevice",
+                                                 pristine, sizeof(pristine)))
+    {
+        Log("[bridge] d3d12_hook=1: could not read the pristine System32 export; "
+            "the existing hook remains in place.");
+        return false;
+    }
+
+    // On this Windows build the first instruction is exactly five bytes:
+    //   48 89 5C 24 xx    mov [rsp+xx], rbx
+    // ReShade replaces exactly that instruction with E9 rel32. Refuse every
+    // other shape instead of guessing an instruction boundary.
+    if (entry[0] != 0xE9 || pristine[0] != 0x48 || pristine[1] != 0x89 ||
+        pristine[2] != 0x5C || pristine[3] != 0x24)
+    {
+        Log("[bridge] d3d12_hook=1 refused: live %02X %02X %02X %02X %02X, "
+            "pristine %02X %02X %02X %02X %02X; expected E9 rel32 over one "
+            "five-byte stack-store instruction.",
+            entry[0], entry[1], entry[2], entry[3], entry[4],
+            pristine[0], pristine[1], pristine[2], pristine[3], pristine[4]);
+        return false;
+    }
+
+    memcpy(saved, entry, 5);
+    if (!VirtualProtect(entry, 5, PAGE_EXECUTE_READWRITE, old_protect)) return false;
+    memcpy(entry, pristine, 5);
+    FlushInstructionCache(GetCurrentProcess(), entry, 5);
+    Log("[bridge] d3d12_hook=1: temporarily restored pristine D3D12CreateDevice "
+        "entry bytes for this one guarded call.");
+    return true;
+}
+
+static void RestoreD3D12Detour(PFN_D3D12CreateDevice_ fn, const BYTE saved[5],
+                               DWORD old_protect)
+{
+    BYTE *entry = reinterpret_cast<BYTE *>(fn);
+    DWORD ignored = 0;
+    memcpy(entry, saved, 5);
+    FlushInstructionCache(GetCurrentProcess(), entry, 5);
+    VirtualProtect(entry, 5, old_protect, &ignored);
+    Log("[bridge] d3d12_hook=1: restored the pre-existing D3D12CreateDevice detour.");
+}
+
 static HRESULT SafeCreateDevice(PFN_D3D12CreateDevice_ fn, IDXGIAdapter *ad,
                                 ID3D12Device **out, DWORD *code)
 {
@@ -413,10 +540,15 @@ static HRESULT SafeCreateDevice(PFN_D3D12CreateDevice_ fn, IDXGIAdapter *ad,
     IUnknown *first = g_cfg.adapter == 1 ? nullptr : ad;
     Log("[bridge] D3D12CreateDevice adapter strategy %d: first argument %s",
         g_cfg.adapter, first == nullptr ? "nullptr (Windows default)" : "game adapter");
+    BYTE saved[5] = {};
+    DWORD old_protect = 0;
+    const bool bypassed = g_cfg.d3d12_hook != 0 &&
+                          RestorePristineD3D12Entry(fn, saved, &old_protect);
     __try { hr = fn(first, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
                     reinterpret_cast<void **>(out)); }
     __except (CaptureFault(GetExceptionInformation()))
     { *code = GetExceptionCode(); }
+    if (bypassed) RestoreD3D12Detour(fn, saved, old_protect);
 
     // FFXV's D3D11 device can yield an adapter object that D3D12Core rejects
     // before returning an HRESULT. The null-adapter form asks Windows to select
